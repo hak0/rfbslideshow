@@ -1,0 +1,6 @@
+# config.toml
+
+scan_folder = "/path/to/images"
+interval = 5
+status_bar_font_path = "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf"
+status_bar_height = 48

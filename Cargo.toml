@@ -1,0 +1,15 @@
+# Cargo.toml
+[package]
+name = "rfbslideshow"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+image = { version = "*", features = ["gif"] }
+rusttype = "*"
+serde = { version = "*", features = ["derive"] }
+toml = "*"
+jwalk = "*"
+rayon = "*"
+fast_image_resize = { version = "*", features = ["image"] }
+memmap2 = "*"
