@@ -1,6 +1,17 @@
 # config.toml
 
-scan_folder = "/path/to/images"
+folder_path = "/path/to/images"
 interval = 5
 status_bar_font_path = "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf"
 status_bar_height = 48
+
+# a http server at 0.0.0.0, use GET to manipulate the slideshow player
+## e.g. curl "http://raspberrypi3b:3030/pause"
+## Available operations:
+##  pause
+##  continue
+##  prev
+##  next
+##  rescan (re-scan the folder and play slideshow from the beginning)
+##  reload (reload the updated config file)
+http_server_port = 3030
