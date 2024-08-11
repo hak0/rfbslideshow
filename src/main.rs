@@ -177,9 +177,14 @@ fn setup_routes(state: Arc<SlideshowState>, image_list: Arc<RwLock<Vec<(PathBuf,
         .and(config_filter.clone())
         .and(image_list_filter.clone())
         .map(move |state: Arc<SlideshowState>, config: Arc<RwLock<Config>>, image_list: Arc<RwLock<Vec<(PathBuf, ImageFormat)>>>| {
+            // pause the slideshow first
+            let pause_value = state.paused.load(std::sync::atomic::Ordering::Relaxed);
+            state.paused.store(true, std::sync::atomic::Ordering::Relaxed);
             let config = config.read().unwrap();
             let mut image_list = image_list.write().unwrap();
             *image_list = scan_folder(&config.folder_path, state.clone());
+            // restore pause state
+            state.paused.store(pause_value, std::sync::atomic::Ordering::Relaxed);
             warp::reply::json(&"Rescan")
         });
 
@@ -293,6 +298,10 @@ fn run_slideshow(
 }
 
 fn scan_folder(scan_folder_path: &str, state: Arc<SlideshowState>) -> Vec<(PathBuf, ImageFormat)> {
+    // pause the slideshow first
+    let pause_value = state.paused.load(std::sync::atomic::Ordering::Relaxed);
+    state.paused.store(true, std::sync::atomic::Ordering::Relaxed);
+
     let image_list : Vec<(PathBuf, ImageFormat)> = WalkDir::new(scan_folder_path)
         .into_iter()
         .filter_map(|entry_result| entry_result.ok()) // Handle errors by filtering out invalid entries
@@ -304,6 +313,7 @@ fn scan_folder(scan_folder_path: &str, state: Arc<SlideshowState>) -> Vec<(PathB
         .collect();
     state.image_list_len.store(image_list.len(), std::sync::atomic::Ordering::Relaxed);
     state.current_index.store(0, std::sync::atomic::Ordering::Relaxed);
+    state.paused.store(pause_value, std::sync::atomic::Ordering::Relaxed);
     image_list
 }
 
