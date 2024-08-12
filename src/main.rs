@@ -134,6 +134,7 @@ fn setup_routes(state: Arc<SlideshowState>, image_list: Arc<RwLock<Vec<(PathBuf,
     let config_filter = warp::any().map(move || Arc::clone(&config));
     let image_list_filter = warp::any().map(move || Arc::clone(&image_list));
 
+    // usage: http://serverhost/pause -> pause the slideshow
     let pause_route = warp::path("pause")
         .and(state_filter.clone())
         .map(|state: Arc<SlideshowState>| {
@@ -141,6 +142,7 @@ fn setup_routes(state: Arc<SlideshowState>, image_list: Arc<RwLock<Vec<(PathBuf,
             warp::reply::json(&"Paused")
         });
 
+    // usage: http://serverhost/continue -> continue the slideshow
     let continue_route = warp::path("continue")
         .and(state_filter.clone())
         .map(|state: Arc<SlideshowState>| {
@@ -148,6 +150,7 @@ fn setup_routes(state: Arc<SlideshowState>, image_list: Arc<RwLock<Vec<(PathBuf,
             warp::reply::json(&"Continued")
         });
 
+    // usage: http://serverhost/prev -> move to the previous image
     let prev_route = warp::path("prev")
         .and(state_filter.clone())
         .map(move |state: Arc<SlideshowState>| {
@@ -160,6 +163,7 @@ fn setup_routes(state: Arc<SlideshowState>, image_list: Arc<RwLock<Vec<(PathBuf,
             warp::reply::json(&"Previous")
         });
 
+    // usage: http://serverhost/next -> move to the next image
     let next_route = warp::path("next")
         .and(state_filter.clone())
         .map(move |state: Arc<SlideshowState>| {
@@ -172,6 +176,7 @@ fn setup_routes(state: Arc<SlideshowState>, image_list: Arc<RwLock<Vec<(PathBuf,
             warp::reply::json(&"Next")
         });
 
+    // usage: http://serverhost/rescan -> rescan the folder and play slideshow from the beginning
     let rescan_route = warp::path("rescan")
         .and(state_filter.clone())
         .and(config_filter.clone())
@@ -188,12 +193,53 @@ fn setup_routes(state: Arc<SlideshowState>, image_list: Arc<RwLock<Vec<(PathBuf,
             warp::reply::json(&"Rescan")
         });
 
+    // usage: http://serverhost/reload -> reload config file
     let reload_route = warp::path("reload")
         .and(config_filter.clone())
         .map(move |config: Arc<RwLock<Config>>| {
             let mut config = config.write().unwrap();
             config.load();
             warp::reply::json(&"Config Reloaded")
+        });
+
+    // usage: http://serverhost/seek/5 -> move to 5th image
+    let seek_route = warp::path("seek")
+        .and(warp::path::param())
+        .and(state_filter.clone())
+        .map(move |index: i64, state: Arc<SlideshowState>| {
+            // check if the index is within the range
+            let image_list_len = state.image_list_len.load(std::sync::atomic::Ordering::Relaxed);
+            if index >= image_list_len as i64|| index < 0{
+                return warp::reply::json(&"Index out of range");
+            }
+            state.current_index.store(index as usize, std::sync::atomic::Ordering::Relaxed);
+            warp::reply::json(&"Seeked")
+        });
+
+    // usage: http://serverhost/query -> get the current image name
+    let query_route = warp::path("query")
+        .and(state_filter.clone())
+        .and(image_list_filter.clone())
+        .map(move |state: Arc<SlideshowState>, image_list: Arc<RwLock<Vec<(PathBuf, ImageFormat)>>>| {
+            let current_index = state.current_index.load(std::sync::atomic::Ordering::Relaxed);
+            let image_list_unlocked = image_list.read().unwrap();
+            let image_name = image_list_unlocked.get(current_index).unwrap().0.file_name().unwrap().to_str().unwrap();
+            warp::reply::json(&image_name)
+        });
+
+
+    // usage: http://serverhost/query/5 -> get the 5th image name
+    let query_with_id_route = warp::path!("query" / i64)
+        .and(image_list_filter.clone())
+        .map(move |index: i64, image_list: Arc<RwLock<Vec<(PathBuf, ImageFormat)>>>| {
+            let image_list_unlocked = image_list.read().unwrap();
+            // check if the index is within the range
+            let image_list_len = image_list_unlocked.len();
+            if index >= image_list_len as i64 || index < 0 {
+                return warp::reply::json(&"Index out of range");
+            }
+            let image_name = image_list_unlocked.get(index as usize).unwrap().0.file_name().unwrap().to_str().unwrap();
+            warp::reply::json(&image_name)
         });
 
     warp::get().and(
@@ -203,6 +249,9 @@ fn setup_routes(state: Arc<SlideshowState>, image_list: Arc<RwLock<Vec<(PathBuf,
             .or(next_route)
             .or(rescan_route)
             .or(reload_route)
+            .or(seek_route)
+            .or(query_with_id_route)
+            .or(query_route)
     )
 }
 
@@ -418,7 +467,6 @@ fn resize_image(img: &DynamicImage, fb_info: &FramebufferInfo, config: Arc<RwLoc
 
 fn draw_statusbar_text(raw_mem: &mut Vec<u8>, fb_info: &FramebufferInfo,config: Arc<RwLock<Config>>, status_text: &str) {
     // Create a new image for the status bar only
-    //let mut bar_image = image::RgbImage::from_pixel(fb_info.width, config.status_bar_height, bar_color);
     let bytes_per_pixel = (fb_info.bits_per_pixel / 8) as i32;
 
     // Read the font data from the file specified in the config
@@ -439,10 +487,16 @@ fn draw_statusbar_text(raw_mem: &mut Vec<u8>, fb_info: &FramebufferInfo,config: 
     let bar_color = Rgb([255, 255, 255]); // White color for background
     let text_color = Rgb([0, 0, 0]); // Black color for text
 
-    // Draw the text on the status bar
+    // Calculate the width of the text
     let v_metrics = font.v_metrics(scale);
-    let offset = rusttype::point(10.0, v_metrics.ascent);
+    let glyphs: Vec<_> = font.layout(status_text, scale, rusttype::point(0.0, 0.0)).collect();
+    let text_width = glyphs.iter().rev().filter_map(|g| g.pixel_bounding_box()).next().map_or(0, |bb| bb.max.x) as f32;
 
+    // Calculate the starting position for right alignment
+    let offset = rusttype::point(fb_info.width as f32 - text_width - 10.0, v_metrics.ascent);
+    println!("offset: {:?}", offset);
+
+    // Draw the text on the status bar, right aligned
     for glyph in font.layout(status_text, scale, offset) {
         if let Some(bounding_box) = glyph.pixel_bounding_box() {
             glyph.draw(|x, y, v| {
@@ -535,22 +589,13 @@ fn write_to_framebuffer(img: &DynamicImage, status_text: &str, fb_info: &Framebu
         config_unlock.status_bar_height.clone()
     };
 
-    // Draw status bar
-    // Prepare buffer according to framebuffer's pixel layout
-    let start = std::time::Instant::now();
-    let mut statusbar_buffer = vec![0xFFu8; (status_bar_height * fb_info.line_length) as usize];
-    draw_statusbar_text(&mut statusbar_buffer, fb_info, config, status_text);
-    framebuffer.write().unwrap().write(&statusbar_buffer).expect("Failed to write to framebuffer");
-    let elapsed = start.elapsed();
-    println!("Drawing status bar Elapsed: {:?}", elapsed);
-
     let start = std::time::Instant::now();
     // Draw Image line-by-line
     let (img_width, img_height) = img.dimensions();
     // To draw the image at 2/3 of the screen width, calculate the starting position
     let x_offset_ratio = 2.0 / 3.0;
     let start_x = ((fb_info.width as f32 * x_offset_ratio) - (img_width as f32 * x_offset_ratio)) as u32;
-    let start_y = (fb_info.height - img_height - status_bar_height) / 2 + status_bar_height;
+    let start_y = (fb_info.height - img_height - status_bar_height) / 2;
 
     (0..img_height.min(fb_info.height)).into_par_iter().for_each(|y| {
         let y_offset = (start_y + y) as usize * fb_info.line_length as usize;
@@ -567,8 +612,22 @@ fn write_to_framebuffer(img: &DynamicImage, status_text: &str, fb_info: &Framebu
         framebuffer_unlocked.seek(SeekFrom::Start(y_offset as u64)).expect("Failed to seek in framebuffer");
         framebuffer_unlocked.write(&line_buffer).expect("Failed to write to framebuffer");
     });
-    //
-
     let elapsed = start.elapsed();
     println!("Copying to fb Elapsed: {:?}", elapsed);
+
+    // Draw status bar
+    // Prepare buffer according to framebuffer's pixel layout
+    let start = std::time::Instant::now();
+    let mut statusbar_buffer = vec![0xFFu8; (status_bar_height * fb_info.line_length) as usize];
+    draw_statusbar_text(&mut statusbar_buffer, fb_info, config, status_text);
+    let start_y = fb_info.height - status_bar_height - 16; // the raspberrypi have some error at the screen corner, move the status bar up a bit
+    let y_offset = start_y as usize * fb_info.line_length as usize;
+    {
+        let mut framebuffer_unlocked = framebuffer.write().unwrap();
+        framebuffer_unlocked.seek(SeekFrom::Start(y_offset as u64)).expect("Failed to seek in framebuffer");
+        framebuffer_unlocked.write(&statusbar_buffer).expect("Failed to write to framebuffer");
+    }
+    let elapsed = start.elapsed();
+    println!("Drawing status bar Elapsed: {:?}", elapsed);
+
 }
