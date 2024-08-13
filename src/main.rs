@@ -1,13 +1,12 @@
 use fast_image_resize::{FilterType, ResizeAlg, ResizeOptions, Resizer};
 use image::codecs::gif::GifDecoder;
-use image::AnimationDecoder;
-use image::{DynamicImage, GenericImageView, ImageFormat, Rgb};
+use image::{DynamicImage, GenericImageView, ImageFormat, Rgb, AnimationDecoder};
 use rusttype::{Font, Scale};
 use serde::Deserialize;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicUsize};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
@@ -17,14 +16,23 @@ use warp::Filter;
 
 
 
-#[derive(Deserialize, Clone)]
+// thread-safe version of config
 struct Config {
-    #[serde(skip)]
-    config_path: String,
+    config_path: RwLock<String>,
+    folder_path: RwLock<String>,
+    interval: AtomicU32,
+    status_bar_font_path: RwLock<String>,
+    status_bar_height: AtomicU32,
+    http_server_port: AtomicU16,
+}
+
+#[derive(Deserialize)]
+struct ConfigPrimitive {
     folder_path: String,
-    interval: u64,
+    interval: u32,
     status_bar_font_path: String,
     status_bar_height: u32,
+    http_server_port: u16,
 }
 
 impl Config {
@@ -33,30 +41,38 @@ impl Config {
         let mut content = String::new();
         file.read_to_string(&mut content)
             .expect("Failed to read config file");
-        let mut new_config : Config = toml::from_str(&content).expect("Failed to parse config file");
-        new_config.config_path = config_path.to_owned();
-        new_config
+        let config_file: ConfigPrimitive = toml::from_str(&content).expect("Failed to parse config file");
+
+        Config {
+            config_path: RwLock::new(config_path.to_owned()),
+            folder_path: RwLock::new(config_file.folder_path),
+            interval: AtomicU32::new(config_file.interval),
+            status_bar_font_path: RwLock::new(config_file.status_bar_font_path),
+            status_bar_height: AtomicU32::new(config_file.status_bar_height),
+            http_server_port: AtomicU16::new(config_file.http_server_port),
+        }
     }
 
-    fn load(&mut self) {
-        let mut file = File::open(&self.config_path).expect("Failed to open config file");
+    fn load(&self) {
+        let config_path = self.config_path.read().unwrap().clone();
+        let mut file = File::open(&config_path).expect("Failed to open config file");
         let mut content = String::new();
         file.read_to_string(&mut content)
             .expect("Failed to read config file");
-        let new_config : Config = toml::from_str(&content).expect("Failed to parse config file");
-        self.folder_path = new_config.folder_path;
-        self.interval = new_config.interval;
-        self.status_bar_font_path = new_config.status_bar_font_path;
-        self.status_bar_height = new_config.status_bar_height;
+        let config_file: ConfigPrimitive = toml::from_str(&content).expect("Failed to parse config file");
+
+        *self.folder_path.write().unwrap() = config_file.folder_path;
+        self.interval.store(config_file.interval, std::sync::atomic::Ordering::SeqCst);
+        *self.status_bar_font_path.write().unwrap() = config_file.status_bar_font_path;
+        self.status_bar_height.store(config_file.status_bar_height, std::sync::atomic::Ordering::SeqCst);
+        self.http_server_port.store(config_file.http_server_port, std::sync::atomic::Ordering::SeqCst);
     }
 }
-
-
 #[derive(Clone)]
 struct FramebufferInfo {
     width: u32,
     height: u32,
-    line_length: u32,     // number of bytes per line
+    bytes_per_line: u32,
     bits_per_pixel: u32,
 }
 
@@ -65,6 +81,7 @@ struct SlideshowState {
     paused: Arc<AtomicBool>,
     current_index: Arc<AtomicUsize>,
     image_list_len: Arc<AtomicUsize>,
+    need_rescan: Arc<AtomicBool>,
 }
 
 fn main() {
@@ -78,37 +95,32 @@ fn main() {
 
     // initialize data containers
     // lock order: config -> image_list
-    let config = Arc::new(RwLock::new(Config::new(&args[2])));
+    let config = Arc::new(Config::new(&args[2]));
     let state = Arc::new(SlideshowState {
         paused: Arc::new(AtomicBool::new(false)),
         current_index: Arc::new(AtomicUsize::new(0)),
         image_list_len: Arc::new(AtomicUsize::new(0)),
+        need_rescan: Arc::new(AtomicBool::new(true)),
     });
-    let image_list = {
-        let config_unlock = config.read().unwrap();
-        Arc::new(RwLock::new(scan_folder(&config_unlock.folder_path, state.clone())))
-    };
 
-    let routes = setup_routes(state.clone(), image_list.clone(), config.clone());
+    let routes = setup_routes(state.clone(), config.clone());
+    let port = config.http_server_port.load(std::sync::atomic::Ordering::Relaxed);
 
     // Spawn a new thread to run the warp server
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        // create a single-thread runtime
+        let rt = tokio::runtime::Builder::new_current_thread().enable_io().build().unwrap();
         rt.block_on(async {
-            warp::serve(routes).run(([0, 0, 0, 0], 3030)).await;
+            warp::serve(routes).run(([0, 0, 0, 0], port)).await;
         });
     });
 
     // Create a new thread to increase the index with configured interval
     let state_clone = state.clone();
     let config_clone = config.clone();
-
     std::thread::spawn(move || {
         loop {
-            let sleep_interval = {
-                let config = config_clone.read().unwrap();
-                config.interval
-            };
+            let sleep_interval = config_clone.interval.load(std::sync::atomic::Ordering::Relaxed) as u64;
             std::thread::sleep(std::time::Duration::from_secs(sleep_interval));
             maybe_increase_index(&state_clone);
             println!("index: {}", state_clone.current_index.load(std::sync::atomic::Ordering::Relaxed));
@@ -118,9 +130,8 @@ fn main() {
     // Run the slideshow loop
     let state_clone = state.clone();
     let config_clone = config.clone();
-    let image_list_clone = image_list.clone();
     std::thread::spawn(move || {
-        run_slideshow(fb_info, state_clone, config_clone, image_list_clone);
+        run_slideshow(fb_info, state_clone, config_clone);
     });
 
     // Keep the main function alive
@@ -129,10 +140,9 @@ fn main() {
     }
 }
 
-fn setup_routes(state: Arc<SlideshowState>, image_list: Arc<RwLock<Vec<(PathBuf, ImageFormat)>>>, config: Arc<RwLock<Config>>) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
+fn setup_routes(state: Arc<SlideshowState>, config: Arc<Config>) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
     let state_filter = warp::any().map(move || Arc::clone(&state));
     let config_filter = warp::any().map(move || Arc::clone(&config));
-    let image_list_filter = warp::any().map(move || Arc::clone(&image_list));
 
     // usage: http://serverhost/pause -> pause the slideshow
     let pause_route = warp::path("pause")
@@ -179,25 +189,15 @@ fn setup_routes(state: Arc<SlideshowState>, image_list: Arc<RwLock<Vec<(PathBuf,
     // usage: http://serverhost/rescan -> rescan the folder and play slideshow from the beginning
     let rescan_route = warp::path("rescan")
         .and(state_filter.clone())
-        .and(config_filter.clone())
-        .and(image_list_filter.clone())
-        .map(move |state: Arc<SlideshowState>, config: Arc<RwLock<Config>>, image_list: Arc<RwLock<Vec<(PathBuf, ImageFormat)>>>| {
-            // pause the slideshow first
-            let pause_value = state.paused.load(std::sync::atomic::Ordering::Relaxed);
-            state.paused.store(true, std::sync::atomic::Ordering::Relaxed);
-            let config = config.read().unwrap();
-            let mut image_list = image_list.write().unwrap();
-            *image_list = scan_folder(&config.folder_path, state.clone());
-            // restore pause state
-            state.paused.store(pause_value, std::sync::atomic::Ordering::Relaxed);
+        .map(move |state: Arc<SlideshowState>| {
+            state.need_rescan.store(true, std::sync::atomic::Ordering::Relaxed);
             warp::reply::json(&"Rescan")
         });
 
     // usage: http://serverhost/reload -> reload config file
     let reload_route = warp::path("reload")
         .and(config_filter.clone())
-        .map(move |config: Arc<RwLock<Config>>| {
-            let mut config = config.write().unwrap();
+        .map(move |config: Arc<Config>| {
             config.load();
             warp::reply::json(&"Config Reloaded")
         });
@@ -216,32 +216,6 @@ fn setup_routes(state: Arc<SlideshowState>, image_list: Arc<RwLock<Vec<(PathBuf,
             warp::reply::json(&"Seeked")
         });
 
-    // usage: http://serverhost/query -> get the current image name
-    let query_route = warp::path("query")
-        .and(state_filter.clone())
-        .and(image_list_filter.clone())
-        .map(move |state: Arc<SlideshowState>, image_list: Arc<RwLock<Vec<(PathBuf, ImageFormat)>>>| {
-            let current_index = state.current_index.load(std::sync::atomic::Ordering::Relaxed);
-            let image_list_unlocked = image_list.read().unwrap();
-            let image_name = image_list_unlocked.get(current_index).unwrap().0.file_name().unwrap().to_str().unwrap();
-            warp::reply::json(&image_name)
-        });
-
-
-    // usage: http://serverhost/query/5 -> get the 5th image name
-    let query_with_id_route = warp::path!("query" / i64)
-        .and(image_list_filter.clone())
-        .map(move |index: i64, image_list: Arc<RwLock<Vec<(PathBuf, ImageFormat)>>>| {
-            let image_list_unlocked = image_list.read().unwrap();
-            // check if the index is within the range
-            let image_list_len = image_list_unlocked.len();
-            if index >= image_list_len as i64 || index < 0 {
-                return warp::reply::json(&"Index out of range");
-            }
-            let image_name = image_list_unlocked.get(index as usize).unwrap().0.file_name().unwrap().to_str().unwrap();
-            warp::reply::json(&image_name)
-        });
-
     warp::get().and(
         pause_route
             .or(continue_route)
@@ -250,32 +224,42 @@ fn setup_routes(state: Arc<SlideshowState>, image_list: Arc<RwLock<Vec<(PathBuf,
             .or(rescan_route)
             .or(reload_route)
             .or(seek_route)
-            .or(query_with_id_route)
-            .or(query_route)
     )
 }
 
-fn maybe_increase_index(state_clone: &Arc<SlideshowState>) {
-    let current_index = state_clone.current_index.load(std::sync::atomic::Ordering::Relaxed);
-    let image_list_len = state_clone.image_list_len.load(std::sync::atomic::Ordering::Relaxed);
-    let paused = state_clone.paused.load(std::sync::atomic::Ordering::Relaxed);
+fn maybe_increase_index(state: &Arc<SlideshowState>) {
+    let current_index = state.current_index.load(std::sync::atomic::Ordering::Relaxed);
+    let image_list_len = state.image_list_len.load(std::sync::atomic::Ordering::Relaxed);
+    let paused = state.paused.load(std::sync::atomic::Ordering::Relaxed);
     if image_list_len != 0 && !paused {
         let new_index = (current_index + 1 + image_list_len) % image_list_len;
-        state_clone.current_index.store(new_index, std::sync::atomic::Ordering::Relaxed);
+        state.current_index.store(new_index, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
+// main "event loop" for the slideshow
 fn run_slideshow(
     fb_info: FramebufferInfo,
     state: Arc<SlideshowState>,
-    config: Arc<RwLock<Config>>, 
-    image_list: Arc<RwLock<Vec<(PathBuf, ImageFormat)>>>,
+    config: Arc<Config>, 
 ) {
+    // private image list inside run_slideshow, won't share it
+    let mut image_list = Vec::new();
+    
     let mut current_index_last_time = None;
     let mut terminal_signal = Arc::new(AtomicBool::new(false));
     loop {
         let current_index = state.current_index.load(std::sync::atomic::Ordering::Relaxed);
         let image_list_len = state.image_list_len.load(std::sync::atomic::Ordering::Relaxed);
+        let needs_rescan = state.need_rescan.load(std::sync::atomic::Ordering::Relaxed);
+
+        // if needs rescan, re-init image_list
+        if needs_rescan {
+            let scan_folder_path = config.folder_path.read().unwrap().clone();
+            state.need_rescan.store(false, std::sync::atomic::Ordering::Relaxed);
+            image_list = scan_folder(&scan_folder_path, state.clone());
+            continue;
+        }
 
         // if image_list is empty, sleep for 1 second
         if image_list_len == 0 {
@@ -298,10 +282,7 @@ fn run_slideshow(
         }
 
         // start displaying the new image
-        let (path, format) = {
-            let image_list_unlocked = image_list.read().unwrap();
-            image_list_unlocked.get(current_index).unwrap().clone()
-        };
+        let (path, format) = image_list[current_index].clone();
 
         // terminate the last running instance
         terminal_signal.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -411,7 +392,7 @@ fn get_framebuffer_info() -> io::Result<FramebufferInfo> {
     Ok(FramebufferInfo {
         width: width,
         height: height,
-        line_length: stride, 
+        bytes_per_line: stride, 
         bits_per_pixel: bits_per_pixel,
     })
 }
@@ -428,10 +409,11 @@ fn get_image_format(path: &Path) -> Option<ImageFormat> {
     }
 }
 
-fn display_image(img: &DynamicImage, resize_algorithm : ResizeAlg ,config : Arc<RwLock<Config>>, fb_info: &FramebufferInfo, status_text: &str) {
+fn display_image(img: &DynamicImage, resize_algorithm : ResizeAlg , config : Arc<Config>, fb_info: &FramebufferInfo, status_text: &str) {
     // read the image with the specified format
     let start = std::time::Instant::now();
     let img = resize_image(&img, fb_info, config.clone(), resize_algorithm);
+
     let elapsed = start.elapsed();
     println!("Resizing Elapsed: {:?}", elapsed);
 
@@ -440,41 +422,31 @@ fn display_image(img: &DynamicImage, resize_algorithm : ResizeAlg ,config : Arc<
     write_to_framebuffer(&img, &status_text, fb_info, config.clone());
 }
 
-fn resize_image(img: &DynamicImage, fb_info: &FramebufferInfo, config: Arc<RwLock<Config>>, algorithm: ResizeAlg) -> DynamicImage {
+fn resize_image(img: &DynamicImage, fb_info: &FramebufferInfo, config: Arc<Config>, algorithm: ResizeAlg) -> DynamicImage {
     let ratio = img.width() as f32 / img.height() as f32;
-    let new_height = {
-        let config_unlock = config.read().unwrap();
-        fb_info.height - config_unlock.status_bar_height
-    };
-    let img = if img.height() != new_height {
+    let status_bar_height = config.status_bar_height.load(std::sync::atomic::Ordering::Relaxed);
+    let new_height = fb_info.height - status_bar_height;
+    if img.height() != new_height {
         // Create Resizer instance and resize source image
         // into buffer of destination image
         let mut resizer = Resizer::new();
-        let mut dest_img = if img.color() == image::ColorType::Rgba8 {
-            DynamicImage::new_rgba8((new_height as f32 * ratio) as u32, new_height as u32)
-        } else {
-            DynamicImage::new_rgb8((new_height as f32 * ratio) as u32, new_height as u32)
-        };
-        resizer.resize(img, &mut dest_img, 
-            //&ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3))).unwrap();
-            &ResizeOptions::new().resize_alg(algorithm)).unwrap();
+        let new_width = (new_height as f32 * ratio) as u32;
+        let mut dest_img = DynamicImage::ImageRgb8(image::RgbImage::new(new_width, new_height));
+        resizer.resize(img, &mut dest_img, &ResizeOptions::new().resize_alg(algorithm)).unwrap();
         dest_img
     } else {
         img.clone()
-    };
-    img
+    }
 }
 
-fn draw_statusbar_text(raw_mem: &mut Vec<u8>, fb_info: &FramebufferInfo,config: Arc<RwLock<Config>>, status_text: &str) {
+fn draw_statusbar_text(raw_mem: &mut Vec<u8>, fb_info: &FramebufferInfo,config: Arc<Config>, status_text: &str) {
     // Create a new image for the status bar only
     let bytes_per_pixel = (fb_info.bits_per_pixel / 8) as i32;
 
     // Read the font data from the file specified in the config
     // check if font exists
-    let config_unlock = config.read().unwrap();
-    let font_path_str = config_unlock.status_bar_font_path.trim().to_owned();
-    let status_bar_height = config_unlock.status_bar_height.clone();
-    drop(config_unlock);
+    let font_path_str = config.status_bar_font_path.read().unwrap().trim().to_string();
+    let status_bar_height = config.status_bar_height.load(std::sync::atomic::Ordering::Relaxed).clone();
     let font_path = Path::new(&font_path_str);
     println!("statusbar font: \"{}\"", font_path_str);
     if !Path::new(font_path).exists() {
@@ -494,7 +466,6 @@ fn draw_statusbar_text(raw_mem: &mut Vec<u8>, fb_info: &FramebufferInfo,config: 
 
     // Calculate the starting position for right alignment
     let offset = rusttype::point(fb_info.width as f32 - text_width - 10.0, v_metrics.ascent);
-    println!("offset: {:?}", offset);
 
     // Draw the text on the status bar, right aligned
     for glyph in font.layout(status_text, scale, offset) {
@@ -504,7 +475,7 @@ fn draw_statusbar_text(raw_mem: &mut Vec<u8>, fb_info: &FramebufferInfo,config: 
                 let y = y as i32 + bounding_box.min.y;
                 if x >= 0 && x < fb_info.width as i32 && y >= 0 && y < status_bar_height as i32 {
                     let x_offset = (x * bytes_per_pixel) as usize;
-                    let y_offset = y as usize * fb_info.line_length as usize;
+                    let y_offset = y as usize * fb_info.bytes_per_line as usize;
                     // reverse rgb to bgr
                     let r = (v * text_color[0] as f32 + (1.0 - v) * bar_color[0] as f32) as u8;
                     let g = (v * text_color[1] as f32 + (1.0 - v) * bar_color[1] as f32) as u8;
@@ -518,10 +489,72 @@ fn draw_statusbar_text(raw_mem: &mut Vec<u8>, fb_info: &FramebufferInfo,config: 
     }
 }
 
-fn display_single_img(path: &Path, format: ImageFormat, config: Arc<RwLock<Config>>, fb_info: &FramebufferInfo, status_text: &str, terminal_signal: Arc<AtomicBool>) {
+fn convert_rgba_or_rgb_to_bgr(img: DynamicImage) -> DynamicImage {
+    let start = std::time::Instant::now();
+    let img = match img.color() {
+        image::ColorType::Rgba8 => {
+            // Convert to RGBA8
+            let img = img.to_rgba8();
+            let (img_width, img_height) = img.dimensions();
+            let img_raw = img.into_raw();
+            let img_pixels = img_raw.len() / 4; // Number of pixels
+
+            // Create a new vector to store the BGR data
+            let mut bgr_raw = vec![0u8; img_pixels * 3];
+
+            // Process each pixel in parallel
+            bgr_raw.par_chunks_mut(3).enumerate().for_each(|(i, bgr_pixel)| {
+                let r = img_raw[i * 4] as u16;
+                let g = img_raw[i * 4 + 1] as u16;
+                let b = img_raw[i * 4 + 2] as u16;
+                let alpha = img_raw[i * 4 + 3] as u16;
+                let r_background = 255 as u16;
+                let g_background = 255 as u16;
+                let b_background = 255 as u16;
+                let r = (r * alpha / 255 + r_background * (255 - alpha) / 255) as u8;
+                let g = (g * alpha / 255 + g_background * (255 - alpha) / 255) as u8;
+                let b = (b * alpha / 255 + b_background * (255 - alpha) / 255) as u8;
+                bgr_pixel[0] = b;
+                bgr_pixel[1] = g;
+                bgr_pixel[2] = r;
+            });
+
+            // Create a new ImageBuffer from the BGR data
+            let new_buffer = image::ImageBuffer::from_vec(img_width, img_height, bgr_raw);
+            DynamicImage::ImageRgb8(new_buffer.unwrap())
+        },
+        image::ColorType::Rgb8 => {
+            let img_buffer = img.to_rgb8();
+            let (img_width, img_height) = img_buffer.dimensions();
+            let mut img_raw = img_buffer.into_raw();
+            // rgb -> bgr
+            img_raw.par_chunks_mut(3).for_each(|pixel| {
+                pixel.swap(0, 2);
+            });
+            let new_buffer = image::ImageBuffer::from_vec(img_width, img_height, img_raw);
+            DynamicImage::ImageRgb8(new_buffer.unwrap())
+        },
+        _ => {
+            println!("Not supported color type");
+            img
+        }
+    };
+    let elapsed = start.elapsed();
+    println!("Color Converting Elapsed: {:?}", elapsed);
+    img
+}
+
+fn display_single_img(path: &Path, format: ImageFormat, config: Arc<Config>, fb_info: &FramebufferInfo, status_text: &str, terminal_signal: Arc<AtomicBool>) {
     if let Ok(img) = image::open(path) {
         println!("image format: {:?}", format);
         println!("image color: {:?}", img.color());
+        // if terminal_signal is true, skip loading image and early return
+        if terminal_signal.load(std::sync::atomic::Ordering::Relaxed) { return; }
+
+        // convert the image to bgr format
+        let img = convert_rgba_or_rgb_to_bgr(img);
+
+
         // if terminal_signal is true, skip loading image and early return
         if terminal_signal.load(std::sync::atomic::Ordering::Relaxed) { return; }
 
@@ -529,7 +562,7 @@ fn display_single_img(path: &Path, format: ImageFormat, config: Arc<RwLock<Confi
     }
 }
 
-fn display_gif(path: &Path, config: Arc<RwLock<Config>>, fb_info: &FramebufferInfo, status_text: &str, terminal_signal: Arc<AtomicBool>) {
+fn display_gif(path: &Path, config: Arc<Config>, fb_info: &FramebufferInfo, status_text: &str, terminal_signal: Arc<AtomicBool>) {
     if let Ok(file) = File::open(path) {
         let file_in = io::BufReader::new(file);
         let decoder = GifDecoder::new(file_in).unwrap();
@@ -548,6 +581,7 @@ fn display_gif(path: &Path, config: Arc<RwLock<Config>>, fb_info: &FramebufferIn
                 // cache it in the img_vec
                 let delay = frame.delay();
                 let img = DynamicImage::ImageRgba8(frame.into_buffer());
+                let img = convert_rgba_or_rgb_to_bgr(img);
                 let pair = (img, delay);
                 img_vec.push(pair.clone());
                 pair
@@ -577,17 +611,14 @@ fn display_gif(path: &Path, config: Arc<RwLock<Config>>, fb_info: &FramebufferIn
     }
 }
 
-fn write_to_framebuffer(img: &DynamicImage, status_text: &str, fb_info: &FramebufferInfo, config: Arc<RwLock<Config>>) {
-    //time it
+fn write_to_framebuffer(img: &DynamicImage, status_text: &str, fb_info: &FramebufferInfo, config: Arc<Config>) {
+    // Time it
     let framebuffer_path = "/dev/fb0";
     let bytes_per_pixel = (fb_info.bits_per_pixel / 8) as usize;
 
     let framebuffer = Arc::new(RwLock::new(io::BufWriter::new(File::create(framebuffer_path).expect("Failed to open framebuffer"))));
 
-    let status_bar_height = {
-        let config_unlock = config.read().unwrap();
-        config_unlock.status_bar_height.clone()
-    };
+    let status_bar_height = config.status_bar_height.load(std::sync::atomic::Ordering::Relaxed);
 
     let start = std::time::Instant::now();
     // Draw Image line-by-line
@@ -597,37 +628,47 @@ fn write_to_framebuffer(img: &DynamicImage, status_text: &str, fb_info: &Framebu
     let start_x = ((fb_info.width as f32 * x_offset_ratio) - (img_width as f32 * x_offset_ratio)) as u32;
     let start_y = (fb_info.height - img_height - status_bar_height) / 2;
 
+    // If image is not type Rgb8 (actually bgr8), warning
+    if img.color() != image::ColorType::Rgb8 {
+        println!("Warning: image color type is not Rgb8(BGR8)");
+    }
+
+    let img_raw = img.as_rgb8().unwrap().as_raw();
+    let framebuffer_clone = Arc::clone(&framebuffer);
+
     (0..img_height.min(fb_info.height)).into_par_iter().for_each(|y| {
-        let y_offset = (start_y + y) as usize * fb_info.line_length as usize;
-        let mut line_buffer = vec![0xFFu8; fb_info.line_length as usize];
+        // Extract the line from the image's raw data
+        let src_y_offset = y as usize * img_width as usize * 3;
+        let dest_y_offset = (start_y + y) as usize * fb_info.bytes_per_line as usize;
+        let mut line_buffer = vec![0xFFu8; fb_info.bytes_per_line as usize];
         for x in 0..img_width.min(fb_info.width) {
-            let pixel = img.get_pixel(x, y);
-            let x_offset = (start_x + x) as usize * bytes_per_pixel;
-            // reverse rgb to bgr
-            line_buffer[x_offset + 0] = pixel.0[2];
-            line_buffer[x_offset + 1] = pixel.0[1];
-            line_buffer[x_offset + 2] = pixel.0[0];
+            let src_x_offset = x as usize * 3;
+            let dest_x_offset = (start_x + x) as usize * bytes_per_pixel;
+            let pixel = &img_raw[src_y_offset + src_x_offset..src_y_offset + src_x_offset + 3];
+            line_buffer[dest_x_offset..dest_x_offset + 3].copy_from_slice(pixel);
         }
-        let mut framebuffer_unlocked = framebuffer.write().unwrap();
-        framebuffer_unlocked.seek(SeekFrom::Start(y_offset as u64)).expect("Failed to seek in framebuffer");
+        let mut framebuffer_unlocked = framebuffer_clone.write().unwrap();
+        framebuffer_unlocked.seek(SeekFrom::Start(dest_y_offset as u64)).expect("Failed to seek in framebuffer");
         framebuffer_unlocked.write(&line_buffer).expect("Failed to write to framebuffer");
     });
+
     let elapsed = start.elapsed();
     println!("Copying to fb Elapsed: {:?}", elapsed);
 
     // Draw status bar
     // Prepare buffer according to framebuffer's pixel layout
     let start = std::time::Instant::now();
-    let mut statusbar_buffer = vec![0xFFu8; (status_bar_height * fb_info.line_length) as usize];
+    let mut statusbar_buffer = vec![0xFFu8; (status_bar_height * fb_info.bytes_per_line) as usize];
     draw_statusbar_text(&mut statusbar_buffer, fb_info, config, status_text);
-    let start_y = fb_info.height - status_bar_height - 16; // the raspberrypi have some error at the screen corner, move the status bar up a bit
-    let y_offset = start_y as usize * fb_info.line_length as usize;
+    let start_y = fb_info.height - status_bar_height - 16; // The raspberrypi have some error at the screen corner, move the status bar up a bit
+    let y_offset = start_y as usize * fb_info.bytes_per_line as usize;
+
     {
         let mut framebuffer_unlocked = framebuffer.write().unwrap();
         framebuffer_unlocked.seek(SeekFrom::Start(y_offset as u64)).expect("Failed to seek in framebuffer");
         framebuffer_unlocked.write(&statusbar_buffer).expect("Failed to write to framebuffer");
     }
+
     let elapsed = start.elapsed();
     println!("Drawing status bar Elapsed: {:?}", elapsed);
-
 }
