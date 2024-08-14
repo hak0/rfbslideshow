@@ -1245,6 +1245,7 @@ dependencies = [
  "fast_image_resize",
  "image",
  "jwalk",
+ "parking_lot",
  "rayon",
  "rusttype",
  "serde",

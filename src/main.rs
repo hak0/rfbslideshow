@@ -8,6 +8,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicUsize};
 use std::sync::{Arc, RwLock};
+use parking_lot::Mutex;
 use std::thread;
 use std::time::Duration;
 use jwalk::WalkDir;
@@ -616,7 +617,7 @@ fn write_to_framebuffer(img: &DynamicImage, status_text: &str, fb_info: &Framebu
     let framebuffer_path = "/dev/fb0";
     let bytes_per_pixel = (fb_info.bits_per_pixel / 8) as usize;
 
-    let framebuffer = Arc::new(RwLock::new(io::BufWriter::new(File::create(framebuffer_path).expect("Failed to open framebuffer"))));
+    let framebuffer = Arc::new(Mutex::new(io::BufWriter::new(File::create(framebuffer_path).expect("Failed to open framebuffer"))));
 
     let status_bar_height = config.status_bar_height.load(std::sync::atomic::Ordering::Relaxed);
 
@@ -658,7 +659,7 @@ fn write_to_framebuffer(img: &DynamicImage, status_text: &str, fb_info: &Framebu
             }
         }
         let dest_y_offset = (start_y + y) as usize * fb_info.bytes_per_line as usize;
-        let mut framebuffer_unlocked = framebuffer_clone.write().unwrap();
+        let mut framebuffer_unlocked = framebuffer_clone.lock();
         framebuffer_unlocked.seek(SeekFrom::Start(dest_y_offset as u64)).expect("Failed to seek in framebuffer");
         framebuffer_unlocked.write(&line_buffer).expect("Failed to write to framebuffer");
     });
@@ -674,7 +675,7 @@ fn write_to_framebuffer(img: &DynamicImage, status_text: &str, fb_info: &Framebu
     let y_offset = start_y as usize * fb_info.bytes_per_line as usize;
 
     {
-        let mut framebuffer_unlocked = framebuffer.write().unwrap();
+        let mut framebuffer_unlocked = framebuffer.lock();
         framebuffer_unlocked.seek(SeekFrom::Start(y_offset as u64)).expect("Failed to seek in framebuffer");
         framebuffer_unlocked.write(&statusbar_buffer).expect("Failed to write to framebuffer");
     }

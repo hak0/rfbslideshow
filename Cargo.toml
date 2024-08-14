@@ -14,3 +14,4 @@ rayon = "*"
 fast_image_resize = { version = "*", features = ["image"] }
 warp = "*"
 tokio = { version = "*", features = ["full"] }
+parking_lot = "*"
