@@ -636,22 +636,32 @@ fn write_to_framebuffer(img: &DynamicImage, status_text: &str, fb_info: &Framebu
     let img_raw = img.as_rgb8().unwrap().as_raw();
     let framebuffer_clone = Arc::clone(&framebuffer);
 
-    (0..img_height.min(fb_info.height)).into_par_iter().for_each(|y| {
-        // Extract the line from the image's raw data
-        let src_y_offset = y as usize * img_width as usize * 3;
-        let dest_y_offset = (start_y + y) as usize * fb_info.bytes_per_line as usize;
-        let mut line_buffer = vec![0xFFu8; fb_info.bytes_per_line as usize];
-        for x in 0..img_width.min(fb_info.width) {
-            let src_x_offset = x as usize * 3;
-            let dest_x_offset = (start_x + x) as usize * bytes_per_pixel;
-            let pixel = &img_raw[src_y_offset + src_x_offset..src_y_offset + src_x_offset + 3];
-            line_buffer[dest_x_offset..dest_x_offset + 3].copy_from_slice(pixel);
+    // draw the image line-by-line, but draw multiple lines at once to reduce the number of write calls
+    let line_batch = rayon::current_num_threads();
+    println!("line_batch: {}", line_batch);
+    (0..img_height.min(fb_info.height)).into_par_iter().step_by(line_batch).for_each(|y| {
+        let mut line_buffer = vec![0xFFu8; fb_info.bytes_per_line as usize * line_batch];
+        for i in 0..line_batch {
+            let y = y as usize;
+            let yi = y + i;
+            if yi >= img_height.min(fb_info.height) as usize{
+                break;
+            }
+            // Extract the line from the image's raw data
+            let src_y_offset = yi as usize * img_width as usize * 3;
+            let dest_y_offset = i * fb_info.bytes_per_line as usize;
+            for x in 0..img_width.min(fb_info.width) {
+                let src_x_offset = x as usize * 3;
+                let dest_x_offset = (start_x + x) as usize * bytes_per_pixel + dest_y_offset;
+                let pixel = &img_raw[src_y_offset + src_x_offset..src_y_offset + src_x_offset + 3];
+                line_buffer[dest_x_offset..dest_x_offset + 3].copy_from_slice(pixel);
+            }
         }
+        let dest_y_offset = (start_y + y) as usize * fb_info.bytes_per_line as usize;
         let mut framebuffer_unlocked = framebuffer_clone.write().unwrap();
         framebuffer_unlocked.seek(SeekFrom::Start(dest_y_offset as u64)).expect("Failed to seek in framebuffer");
         framebuffer_unlocked.write(&line_buffer).expect("Failed to write to framebuffer");
     });
-
     let elapsed = start.elapsed();
     println!("Copying to fb Elapsed: {:?}", elapsed);
 
