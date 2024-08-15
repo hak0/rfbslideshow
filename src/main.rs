@@ -6,14 +6,15 @@ use serde::Deserialize;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicUsize, Ordering};
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, RwLock};
 use parking_lot::Mutex;
 use std::thread;
 use std::time::Duration;
 use jwalk::WalkDir;
 use rayon::prelude::*;
-use warp::Filter;
+use rouille::{Request, Response};
 
 
 
@@ -83,6 +84,7 @@ struct SlideshowState {
     current_index: Arc<AtomicUsize>,
     image_list_len: Arc<AtomicUsize>,
     need_rescan: Arc<AtomicBool>,
+    need_query: Arc<AtomicBool>,
 }
 
 fn main() {
@@ -102,17 +104,18 @@ fn main() {
         current_index: Arc::new(AtomicUsize::new(0)),
         image_list_len: Arc::new(AtomicUsize::new(0)),
         need_rescan: Arc::new(AtomicBool::new(true)),
+        need_query: Arc::new(AtomicBool::new(false)),
     });
-
-    let routes = setup_routes(state.clone(), config.clone());
-    let port = config.http_server_port.load(std::sync::atomic::Ordering::Relaxed);
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
 
     // Spawn a new thread to run the warp server
+    let port = config.http_server_port.load(std::sync::atomic::Ordering::Relaxed);
+    let state_clone = state.clone();
+    let config_clone = config.clone();
     std::thread::spawn(move || {
-        // create a single-thread runtime
-        let rt = tokio::runtime::Builder::new_current_thread().enable_io().build().unwrap();
-        rt.block_on(async {
-            warp::serve(routes).run(([0, 0, 0, 0], port)).await;
+        let rx_clone = Arc::new(Mutex::new(rx));
+        rouille::start_server(format!("0.0.0.0:{}", port), move |request| {
+            setup_routes(request, state_clone.clone(), config_clone.clone(), rx_clone.clone())
         });
     });
 
@@ -132,7 +135,7 @@ fn main() {
     let state_clone = state.clone();
     let config_clone = config.clone();
     std::thread::spawn(move || {
-        run_slideshow(fb_info, state_clone, config_clone);
+        run_slideshow(fb_info, state_clone, config_clone, tx);
     });
 
     // Keep the main function alive
@@ -141,93 +144,117 @@ fn main() {
     }
 }
 
-fn setup_routes(state: Arc<SlideshowState>, config: Arc<Config>) -> impl Filter<Extract = impl warp::Reply, Error = warp::Rejection> + Clone {
-    let state_filter = warp::any().map(move || Arc::clone(&state));
-    let config_filter = warp::any().map(move || Arc::clone(&config));
-
-    // usage: http://serverhost/pause -> pause the slideshow
-    let pause_route = warp::path("pause")
-        .and(state_filter.clone())
-        .map(|state: Arc<SlideshowState>| {
-            state.paused.store(true, std::sync::atomic::Ordering::Relaxed);
-            warp::reply::json(&"Paused")
-        });
-
-    // usage: http://serverhost/continue -> continue the slideshow
-    let continue_route = warp::path("continue")
-        .and(state_filter.clone())
-        .map(|state: Arc<SlideshowState>| {
-            state.paused.store(false, std::sync::atomic::Ordering::Relaxed);
-            warp::reply::json(&"Continued")
-        });
-
-    // usage: http://serverhost/prev -> move to the previous image
-    let prev_route = warp::path("prev")
-        .and(state_filter.clone())
-        .map(move |state: Arc<SlideshowState>| {
-            let image_list_len = state.image_list_len.load(std::sync::atomic::Ordering::Relaxed);
-            if image_list_len > 0  {
-                let current_index_value = state.current_index.load(std::sync::atomic::Ordering::Relaxed);
-                let new_index_value = (current_index_value + image_list_len- 1) % image_list_len;
-                state.current_index.store(new_index_value, std::sync::atomic::Ordering::Relaxed);
+// currently there is no lock or mutex to protect the opreations
+// the user needs to take care by themselves.
+// e.g. don't rescan when uploading, or don't continue/prev/next/seek when rescnaning
+fn setup_routes(request: &Request, state: Arc<SlideshowState>, config: Arc<Config>, rx: Arc<Mutex<Receiver<String>>>) -> Response {
+    rouille::router!(request,
+        // usage: http://serverhost/pause -> pause the slideshow loop
+        (GET) (/pause) => {
+            state.paused.store(true, Ordering::Relaxed);
+            Response::json(&"Paused")
+        },
+        // usage: http://serverhost/resume -> resume the slideshow loop
+        (GET) (/resume) => {
+            state.paused.store(false, Ordering::Relaxed);
+            Response::json(&"Resumed")
+        },
+        // usage: http://serverhost/prev -> move to the previous image
+        (GET) (/prev) => {
+            let image_list_len = state.image_list_len.load(Ordering::Relaxed);
+            if image_list_len > 0 {
+                let current_index_value = state.current_index.load(Ordering::Relaxed);
+                let new_index_value = (current_index_value + image_list_len - 1) % image_list_len;
+                state.current_index.store(new_index_value, Ordering::Relaxed);
             }
-            warp::reply::json(&"Previous")
-        });
-
-    // usage: http://serverhost/next -> move to the next image
-    let next_route = warp::path("next")
-        .and(state_filter.clone())
-        .map(move |state: Arc<SlideshowState>| {
-            let image_list_len = state.image_list_len.load(std::sync::atomic::Ordering::Relaxed);
-            if image_list_len > 0  {
-                let current_index_value = state.current_index.load(std::sync::atomic::Ordering::Relaxed);
-                let new_index_value = (current_index_value + image_list_len + 1) % image_list_len;
-                state.current_index.store(new_index_value, std::sync::atomic::Ordering::Relaxed);
+            Response::json(&"Previous")
+        },
+        // usage: http://serverhost/next -> move to the next image
+        (GET) (/next) => {
+            let image_list_len = state.image_list_len.load(Ordering::Relaxed);
+            if image_list_len > 0 {
+                let current_index_value = state.current_index.load(Ordering::Relaxed);
+                let new_index_value = (current_index_value + 1) % image_list_len;
+                state.current_index.store(new_index_value, Ordering::Relaxed);
             }
-            warp::reply::json(&"Next")
-        });
-
-    // usage: http://serverhost/rescan -> rescan the folder and play slideshow from the beginning
-    let rescan_route = warp::path("rescan")
-        .and(state_filter.clone())
-        .map(move |state: Arc<SlideshowState>| {
-            state.need_rescan.store(true, std::sync::atomic::Ordering::Relaxed);
-            warp::reply::json(&"Rescan")
-        });
-
-    // usage: http://serverhost/reload -> reload config file
-    let reload_route = warp::path("reload")
-        .and(config_filter.clone())
-        .map(move |config: Arc<Config>| {
+            Response::json(&"Next")
+        },
+        // usage: http://serverhost/rescan -> rescan the folder for new images
+        (GET) (/rescan) => {
+            state.need_rescan.store(true, Ordering::Relaxed);
+            let start = std::time::Instant::now();
+            while state.need_rescan.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if start.elapsed().as_secs() > 180 {
+                    state.need_rescan.store(false, Ordering::Relaxed);
+                    return Response::json(&"Rescan failed, 180s timeout");
+                }
+            }
+            Response::json(&"Rescan")
+        },
+        // usage: http://serverhost/reload -> reload the config file
+        (GET) (/reload) => {
             config.load();
-            warp::reply::json(&"Config Reloaded")
-        });
-
-    // usage: http://serverhost/seek/5 -> move to 5th image
-    let seek_route = warp::path("seek")
-        .and(warp::path::param())
-        .and(state_filter.clone())
-        .map(move |index: i64, state: Arc<SlideshowState>| {
-            // check if the index is within the range
-            let image_list_len = state.image_list_len.load(std::sync::atomic::Ordering::Relaxed);
-            if index >= image_list_len as i64|| index < 0{
-                return warp::reply::json(&"Index out of range");
+            Response::json(&"Config Reloaded")
+        },
+        // usage: http://serverhost/seek/{index} -> seek to the specified index
+        (GET) (/seek/{index: usize}) => {
+            let image_list_len = state.image_list_len.load(Ordering::Relaxed);
+            if index >= image_list_len {
+                return Response::json(&"Index out of range");
             }
-            state.current_index.store(index as usize, std::sync::atomic::Ordering::Relaxed);
-            warp::reply::json(&"Seeked")
-        });
+            state.current_index.store(index, Ordering::Relaxed);
+            Response::json(&"Seeked")
+        },
+        // usage: http://serverhost/query -> queyr the current image name
+        (GET) (/query) => {
+            state.need_query.store(true, Ordering::Relaxed);
+            let image_name = rx.lock().recv().unwrap();
+            Response::json(&format!("Image name: {}", image_name))
+        },
+        // usage: http://serverhost/clearfolder -> clear the folder
+        (GET) (/clearfolder) => {
+            state.paused.store(true, Ordering::Relaxed);
+            state.image_list_len.store(0, Ordering::Relaxed);
+            state.current_index.store(0, Ordering::Relaxed);
 
-    warp::get().and(
-        pause_route
-            .or(continue_route)
-            .or(prev_route)
-            .or(next_route)
-            .or(rescan_route)
-            .or(reload_route)
-            .or(seek_route)
+            let folder_path = config.folder_path.read().unwrap().clone();
+            for entry in fs::read_dir(&folder_path).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if path.is_dir() {
+                    fs::remove_dir_all(&path).unwrap();
+                } else {
+                    fs::remove_file(&path).unwrap();
+                }
+            }
+
+            Response::json(&"Folder Cleared")
+        },
+        // usage: http://serverhost/upload/{image_name} -> upload an image
+        (POST) (/upload/{image_name: String}) => {
+            let data = request.data().expect("Failed to read request data");
+            let mut body = Vec::new();
+            data.take(10 * 1024 * 1024).read_to_end(&mut body).unwrap(); // limit to 10MB
+
+            state.paused.store(true, Ordering::Relaxed);
+            let folder_path = config.folder_path.read().unwrap().clone();
+            let image_path = Path::new(&folder_path).join(&image_name);
+
+            if image_path.exists() {
+                return Response::json(&"Image already exists");
+            }
+
+            if image_path.components().any(|comp| comp == std::path::Component::ParentDir) {
+                return Response::json(&"Invalid image name, has parent path component");
+            }
+
+            fs::write(&image_path, body).unwrap();
+            Response::json(&"Uploaded")
+        },
+        _ => Response::empty_404()
     )
 }
-
 fn maybe_increase_index(state: &Arc<SlideshowState>) {
     let current_index = state.current_index.load(std::sync::atomic::Ordering::Relaxed);
     let image_list_len = state.image_list_len.load(std::sync::atomic::Ordering::Relaxed);
@@ -243,9 +270,10 @@ fn run_slideshow(
     fb_info: FramebufferInfo,
     state: Arc<SlideshowState>,
     config: Arc<Config>, 
+    tx: std::sync::mpsc::Sender<String>
 ) {
     // private image list inside run_slideshow, won't share it
-    let mut image_list = Vec::new();
+    let mut image_list: Vec<(PathBuf, ImageFormat)> = Vec::new();
     
     let mut current_index_last_time = None;
     let mut terminal_signal = Arc::new(AtomicBool::new(false));
@@ -253,6 +281,19 @@ fn run_slideshow(
         let current_index = state.current_index.load(std::sync::atomic::Ordering::Relaxed);
         let image_list_len = state.image_list_len.load(std::sync::atomic::Ordering::Relaxed);
         let needs_rescan = state.need_rescan.load(std::sync::atomic::Ordering::Relaxed);
+        let needs_query = state.need_query.load(std::sync::atomic::Ordering::Relaxed);
+
+        // response to the query request
+        if needs_query {
+            state.need_query.store(false, std::sync::atomic::Ordering::Relaxed);
+            if image_list_len == 0 {
+                tx.send(String::from("Image list is Empty")).unwrap();
+            } else if current_index >= image_list_len {
+                tx.send(String::from("Invalid")).unwrap();
+            } else if let Some(path) = image_list.get(current_index).map(|(path, _)| path) {
+                tx.send(path.to_str().unwrap().to_string()).unwrap();
+            }
+        }       
 
         // if needs rescan, re-init image_list
         if needs_rescan {

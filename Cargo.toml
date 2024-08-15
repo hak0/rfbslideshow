@@ -1,7 +1,7 @@
 # Cargo.toml
 [package]
 name = "rfbslideshow"
-version = "0.3.1"
+version = "0.3.3"
 edition = "2021"
 
 [dependencies]
@@ -12,6 +12,5 @@ toml = "*"
 jwalk = "*"
 rayon = "*"
 fast_image_resize = { version = "*", features = ["image"] }
-warp = "*"
-tokio = { version = "*", features = ["full"] }
 parking_lot = "*"
+rouille = "*"
