@@ -477,14 +477,23 @@ fn get_image_format(path: &Path) -> Option<ImageFormat> {
 fn display_image(img: &DynamicImage, resize_algorithm : ResizeAlg , config : Arc<Config>, fb_info: &FramebufferInfo, status_text: &str) {
     // read the image with the specified format
     let start = std::time::Instant::now();
-    let img = resize_image(&img, fb_info, config.clone(), resize_algorithm);
+    if resize_algorithm != ResizeAlg::Nearest {
+        let img = resize_image(&img, fb_info, config.clone(), resize_algorithm);
+        let elapsed = start.elapsed();
+        println!("Resizing Elapsed: {:?}", elapsed);
+        // Combine the resized image and the status bar
+        write_to_framebuffer(&img, &status_text, fb_info, config.clone(), 1);
+    } else {
+        println!("Skip Resizing");
+        let scale_x = fb_info.width as f32 / img.width() as f32;
+        let scale_y = fb_info.height as f32 / img.height() as f32;
+        let scale = scale_x.min(scale_y).floor() as u32;
+        // skip resizing and do integer-factor resize in the fb write
+        write_to_framebuffer(&img, &status_text, fb_info, config.clone(), scale);
+    }
 
-    let elapsed = start.elapsed();
-    println!("Resizing Elapsed: {:?}", elapsed);
 
 
-    // Combine the resized image and the status bar
-    write_to_framebuffer(&img, &status_text, fb_info, config.clone());
 }
 
 fn resize_image(img: &DynamicImage, fb_info: &FramebufferInfo, config: Arc<Config>, algorithm: ResizeAlg) -> DynamicImage {
@@ -676,59 +685,124 @@ fn display_gif(path: &Path, config: Arc<Config>, fb_info: &FramebufferInfo, stat
     }
 }
 
-fn write_to_framebuffer(img: &DynamicImage, status_text: &str, fb_info: &FramebufferInfo, config: Arc<Config>) {
+fn write_to_framebuffer(img: &DynamicImage, status_text: &str, fb_info: &FramebufferInfo, config: Arc<Config>, scale: u32) {
     // Time it
     let framebuffer_path = "/dev/fb0";
     let bytes_per_pixel = (fb_info.bits_per_pixel / 8) as usize;
 
-    let framebuffer = Arc::new(Mutex::new(io::BufWriter::new(File::create(framebuffer_path).expect("Failed to open framebuffer"))));
+    let framebuffer = Arc::new(Mutex::new(File::create(framebuffer_path).expect("Failed to open framebuffer")));
 
     let status_bar_height = config.status_bar_height.load(std::sync::atomic::Ordering::Relaxed);
 
     let start = std::time::Instant::now();
     // Draw Image line-by-line
     let (img_width, img_height) = img.dimensions();
-    // To draw the image at 2/3 of the screen width, calculate the starting position
-    let x_offset_ratio = 2.0 / 3.0;
-    let start_x = ((fb_info.width as f32 * x_offset_ratio) - (img_width as f32 * x_offset_ratio)) as u32;
-    let start_y = (fb_info.height - img_height - status_bar_height) / 2;
+    if scale == 1 {
+        // To draw the image at 2/3 of the screen width, calculate the starting position
+        let x_offset_ratio = 2.0 / 3.0;
+        let start_x = ((fb_info.width as f32 * x_offset_ratio) - (img_width as f32 * x_offset_ratio)) as u32;
+        let start_y = (fb_info.height - img_height - status_bar_height) / 2;
 
-    // If image is not type Rgb8 (actually bgr8), warning
-    if img.color() != image::ColorType::Rgb8 {
-        println!("Warning: image color type is not Rgb8(BGR8)");
-    }
-
-    let img_raw = img.as_rgb8().unwrap().as_raw();
-    let framebuffer_clone = Arc::clone(&framebuffer);
-
-    // draw the image line-by-line, but draw multiple lines at once to reduce the number of write calls
-    let line_batch = rayon::current_num_threads();
-    println!("line_batch: {}", line_batch);
-    (0..img_height.min(fb_info.height)).into_par_iter().step_by(line_batch).for_each(|y| {
-        let mut line_buffer = vec![0xFFu8; fb_info.bytes_per_line as usize * line_batch];
-        for i in 0..line_batch {
-            let y = y as usize;
-            let yi = y + i;
-            if yi >= img_height.min(fb_info.height) as usize{
-                break;
-            }
-            // Extract the line from the image's raw data
-            let src_y_offset = yi as usize * img_width as usize * 3;
-            let dest_y_offset = i * fb_info.bytes_per_line as usize;
-            for x in 0..img_width.min(fb_info.width) {
-                let src_x_offset = x as usize * 3;
-                let dest_x_offset = (start_x + x) as usize * bytes_per_pixel + dest_y_offset;
-                let pixel = &img_raw[src_y_offset + src_x_offset..src_y_offset + src_x_offset + 3];
-                line_buffer[dest_x_offset..dest_x_offset + 3].copy_from_slice(pixel);
-            }
+        // If image is not type Rgb8 (actually bgr8), warning
+        if img.color() != image::ColorType::Rgb8 {
+            println!("Warning: image color type is not Rgb8(BGR8)");
         }
-        let dest_y_offset = (start_y + y) as usize * fb_info.bytes_per_line as usize;
-        let mut framebuffer_unlocked = framebuffer_clone.lock();
-        framebuffer_unlocked.seek(SeekFrom::Start(dest_y_offset as u64)).expect("Failed to seek in framebuffer");
-        framebuffer_unlocked.write(&line_buffer).expect("Failed to write to framebuffer");
-    });
-    let elapsed = start.elapsed();
-    println!("Copying to fb Elapsed: {:?}", elapsed);
+
+        let img_raw = img.as_rgb8().unwrap().as_raw();
+        let framebuffer_clone = Arc::clone(&framebuffer);
+
+        // draw the image line-by-line, but draw multiple lines at once to reduce the number of write calls
+        let line_batch = rayon::current_num_threads();
+        println!("line_batch: {}", line_batch);
+        (0..img_height.min(fb_info.height)).into_par_iter().step_by(line_batch).for_each(|y| {
+            let mut line_buffer = vec![0xFFu8; fb_info.bytes_per_line as usize * line_batch];
+            for i in 0..line_batch {
+                let y = y as usize;
+                let yi = y + i;
+                if yi >= img_height.min(fb_info.height) as usize{
+                    break;
+                }
+                // Extract the line from the image's raw data
+                let src_y_offset = yi as usize * img_width as usize * 3;
+                let dest_y_offset = i * fb_info.bytes_per_line as usize;
+                for x in 0..img_width.min(fb_info.width) {
+                    let src_x_offset = x as usize * 3;
+                    let dest_x_offset = (start_x + x) as usize * bytes_per_pixel + dest_y_offset;
+                    let pixel = &img_raw[src_y_offset + src_x_offset..src_y_offset + src_x_offset + 3];
+                    line_buffer[dest_x_offset..dest_x_offset + 3].copy_from_slice(pixel);
+                }
+            }
+            let dest_y_offset = (start_y + y) as usize * fb_info.bytes_per_line as usize;
+            let mut framebuffer_unlocked = framebuffer_clone.lock();
+            framebuffer_unlocked.seek(SeekFrom::Start(dest_y_offset as u64)).expect("Failed to seek in framebuffer");
+            framebuffer_unlocked.write(&line_buffer).expect("Failed to write to framebuffer");
+        });
+        let elapsed = start.elapsed();
+        println!("Copying to fb Elapsed: {:?}", elapsed);
+    } else {
+        // To draw the image at 2/3 of the screen width, calculate the starting position
+        let x_offset_ratio = 2.0 / 3.0;
+        let start_x = ((fb_info.width as f32 * x_offset_ratio) - (scale as f32 * img_width as f32 * x_offset_ratio)) as u32;
+        let start_y = (fb_info.height - scale * img_height - status_bar_height) / 2;
+
+        // If image is not type Rgb8 (actually bgr8), warning
+        if img.color() != image::ColorType::Rgb8 {
+            println!("Warning: image color type is not Rgb8(BGR8)");
+        }
+
+        let img_raw = img.as_rgb8().unwrap().as_raw();
+        let framebuffer_clone = Arc::clone(&framebuffer);
+
+        let line_batch = 1.max(rayon::current_num_threads() / scale as usize);
+
+        // draw the white space first
+        let empty_line_buffer = vec![0xFFu8; fb_info.bytes_per_line as usize];
+        (0..start_y.min(fb_info.height)).into_par_iter().for_each(|y| {
+            let dest_y_offset = y as usize * fb_info.bytes_per_line as usize;
+            let mut framebuffer_unlocked = framebuffer_clone.lock();
+            framebuffer_unlocked.seek(SeekFrom::Start(dest_y_offset as u64)).expect("Failed to seek in framebuffer");
+            framebuffer_unlocked.write(&empty_line_buffer).expect("Failed to write to framebuffer");
+        });
+        // draw the image line-by-line, but draw multiple lines at once to reduce the number of write calls
+        println!("line_batch: {}", line_batch);
+        (0..img_height.min(fb_info.height)).into_par_iter().step_by(line_batch).for_each(|y| {
+            let mut line_buffer = vec![0xFFu8; fb_info.bytes_per_line as usize * line_batch];
+            for i in 0..line_batch {
+                let y = y as usize;
+                let yi = y + i;
+                if yi >= img_height.min(fb_info.height) as usize{
+                    break;
+                }
+                // Extract the line from the image's raw data
+                let src_y_offset = yi as usize * img_width as usize * 3;
+                let dest_y_offset = i * fb_info.bytes_per_line as usize;
+                for x in 0..img_width.min(fb_info.width) {
+                    let src_x_offset = x as usize * 3;
+                    let pixel = &img_raw[src_y_offset + src_x_offset..src_y_offset + src_x_offset + 3];
+                    for j_repeat in 0..scale {
+                        let dest_x_offset = (start_x + scale * x + j_repeat) as usize * bytes_per_pixel + dest_y_offset;
+                        line_buffer[dest_x_offset..dest_x_offset + 3].copy_from_slice(pixel);
+                    }
+                }
+            }
+            let mut framebuffer_unlocked = framebuffer_clone.lock();
+            let dest_y_offset = (start_y + scale * y) as usize * fb_info.bytes_per_line as usize;
+            framebuffer_unlocked.seek(SeekFrom::Start(dest_y_offset as u64)).expect("Failed to seek in framebuffer");
+            for _j_repeat in 0..scale as u32 {
+                framebuffer_unlocked.write(&line_buffer).expect("Failed to write to framebuffer");
+            }
+        });
+        // draw the white space last
+        ((start_y+img_height * scale)..(fb_info.height-status_bar_height - 16)).into_par_iter().for_each(|y| { // The raspberrypi have some error at the screen corner, move the status bar up a bit
+            let dest_y_offset = y as usize * fb_info.bytes_per_line as usize;
+            let mut framebuffer_unlocked = framebuffer_clone.lock();
+            framebuffer_unlocked.seek(SeekFrom::Start(dest_y_offset as u64)).expect("Failed to seek in framebuffer");
+            framebuffer_unlocked.write(&empty_line_buffer).expect("Failed to write to framebuffer");
+        });
+        let elapsed = start.elapsed();
+        println!("Copying to fb Elapsed: {:?}", elapsed);
+
+    }
 
     // Draw status bar
     // Prepare buffer according to framebuffer's pixel layout
