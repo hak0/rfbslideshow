@@ -623,7 +623,7 @@ fn display_single_img(path: &Path, format: ImageFormat, config: Arc<Config>, fb_
         // if terminal_signal is true, skip loading image and early return
         if terminal_signal.load(std::sync::atomic::Ordering::Relaxed) { return; }
 
-        display_image(&img, ResizeAlg::Convolution(FilterType::Lanczos3), config, fb_info, status_text)
+        display_image(&img, ResizeAlg::Convolution(FilterType::Mitchell), config, fb_info, status_text)
     }
 }
 
