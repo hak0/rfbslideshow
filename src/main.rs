@@ -85,6 +85,7 @@ struct SlideshowState {
     image_list_len: Arc<AtomicUsize>,
     need_rescan: Arc<AtomicBool>,
     need_query: Arc<AtomicBool>,
+    slideshow_condvar: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
 }
 
 fn main() {
@@ -105,6 +106,7 @@ fn main() {
         image_list_len: Arc::new(AtomicUsize::new(0)),
         need_rescan: Arc::new(AtomicBool::new(true)),
         need_query: Arc::new(AtomicBool::new(false)),
+        slideshow_condvar: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
     });
     let (tx, rx) = std::sync::mpsc::channel::<String>();
 
@@ -157,6 +159,8 @@ fn setup_routes(request: &Request, state: Arc<SlideshowState>, config: Arc<Confi
         // usage: http://serverhost/resume -> resume the slideshow loop
         (GET) (/resume) => {
             state.paused.store(false, Ordering::Relaxed);
+            // awake the slideshow loop
+            state.slideshow_condvar.1.notify_one();
             Response::json(&"Resumed")
         },
         // usage: http://serverhost/prev -> move to the previous image
@@ -166,6 +170,8 @@ fn setup_routes(request: &Request, state: Arc<SlideshowState>, config: Arc<Confi
                 let current_index_value = state.current_index.load(Ordering::Relaxed);
                 let new_index_value = (current_index_value + image_list_len - 1) % image_list_len;
                 state.current_index.store(new_index_value, Ordering::Relaxed);
+                // awake the slideshow loop
+                state.slideshow_condvar.1.notify_one();
             }
             Response::json(&"Previous")
         },
@@ -176,12 +182,16 @@ fn setup_routes(request: &Request, state: Arc<SlideshowState>, config: Arc<Confi
                 let current_index_value = state.current_index.load(Ordering::Relaxed);
                 let new_index_value = (current_index_value + 1) % image_list_len;
                 state.current_index.store(new_index_value, Ordering::Relaxed);
+                // awake the slideshow loop
+                state.slideshow_condvar.1.notify_one();
             }
             Response::json(&"Next")
         },
         // usage: http://serverhost/rescan -> rescan the folder for new images
         (GET) (/rescan) => {
             state.need_rescan.store(true, Ordering::Relaxed);
+            // awake the slideshow loop
+            state.slideshow_condvar.1.notify_one();
             let start = std::time::Instant::now();
             while state.need_rescan.load(Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_millis(100));
@@ -204,11 +214,15 @@ fn setup_routes(request: &Request, state: Arc<SlideshowState>, config: Arc<Confi
                 return Response::json(&"Index out of range");
             }
             state.current_index.store(index, Ordering::Relaxed);
+            // awake the slideshow loop
+            state.slideshow_condvar.1.notify_one();
             Response::json(&"Seeked")
         },
-        // usage: http://serverhost/query -> queyr the current image name
+        // usage: http://serverhost/query -> query the current image name
         (GET) (/query) => {
             state.need_query.store(true, Ordering::Relaxed);
+            // awake the slideshow loop
+            state.slideshow_condvar.1.notify_one();
             let image_name = rx.lock().recv().unwrap();
             Response::json(&format!("Image name: {}", image_name))
         },
@@ -282,6 +296,7 @@ fn run_slideshow(
         let image_list_len = state.image_list_len.load(std::sync::atomic::Ordering::Relaxed);
         let needs_rescan = state.need_rescan.load(std::sync::atomic::Ordering::Relaxed);
         let needs_query = state.need_query.load(std::sync::atomic::Ordering::Relaxed);
+        let slideshow_condvar_pair = state.slideshow_condvar.clone();
 
         // response to the query request
         if needs_query {
@@ -305,13 +320,13 @@ fn run_slideshow(
 
         // if image_list is empty, sleep for 1 second
         if image_list_len == 0 {
-            std::thread::sleep(std::time::Duration::from_secs(1));
+            sleep_slideshow(slideshow_condvar_pair, Duration::from_secs(1));
             continue;
         }
 
         // if the index is the same as the index last time, sleep for 1 second
         if current_index_last_time == Some(current_index) {
-            std::thread::sleep(std::time::Duration::from_secs(1));
+            sleep_slideshow(slideshow_condvar_pair, Duration::from_secs(1));
             continue;
         } else {
             current_index_last_time = Some(current_index);
@@ -367,6 +382,14 @@ fn run_slideshow(
         // increase the index immediately
         maybe_increase_index(&state)
     }
+}
+
+// use condvar to sleep for a while, that can be awaken by condvar
+// maybe shorter due to Spurious Wakeups, but it's ok
+fn sleep_slideshow(slideshow_condvar_pair: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>, duration: Duration) {
+    let (lock, condvar) = &*slideshow_condvar_pair;
+    let mut _guard = lock.lock().unwrap();
+    let _ = condvar.wait_timeout(_guard, duration);
 }
 
 fn scan_folder(scan_folder_path: &str, state: Arc<SlideshowState>) -> Vec<(PathBuf, ImageFormat)> {
