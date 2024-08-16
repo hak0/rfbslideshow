@@ -16,9 +16,9 @@ use jwalk::WalkDir;
 use rayon::prelude::*;
 use rouille::{Request, Response};
 use std::fs::OpenOptions;
-use memmap2::MmapOptions;
+use memmap2::{MmapOptions, MmapMut};
 
-
+const FB_NUM_BUFFERS: usize = 2; // 2 is the maximum on raspberrypi
 
 // thread-safe version of config
 struct Config {
@@ -28,6 +28,7 @@ struct Config {
     status_bar_font_path: RwLock<String>,
     status_bar_height: AtomicU32,
     http_server_port: AtomicU16,
+    max_fps: AtomicU32,
 }
 
 #[derive(Deserialize)]
@@ -37,6 +38,7 @@ struct ConfigPrimitive {
     status_bar_font_path: String,
     status_bar_height: u32,
     http_server_port: u16,
+    max_fps: u32,
 }
 
 impl Config {
@@ -54,6 +56,7 @@ impl Config {
             status_bar_font_path: RwLock::new(config_file.status_bar_font_path),
             status_bar_height: AtomicU32::new(config_file.status_bar_height),
             http_server_port: AtomicU16::new(config_file.http_server_port),
+            max_fps: AtomicU32::new(config_file.max_fps),
         }
     }
 
@@ -70,14 +73,8 @@ impl Config {
         *self.status_bar_font_path.write().unwrap() = config_file.status_bar_font_path;
         self.status_bar_height.store(config_file.status_bar_height, std::sync::atomic::Ordering::SeqCst);
         self.http_server_port.store(config_file.http_server_port, std::sync::atomic::Ordering::SeqCst);
+        self.max_fps.store(config_file.max_fps, std::sync::atomic::Ordering::SeqCst);
     }
-}
-#[derive(Clone)]
-struct FramebufferInfo {
-    width: u32,
-    height: u32,
-    bytes_per_line: u32,
-    bits_per_pixel: u32,
 }
 
 #[derive(Clone)]
@@ -90,6 +87,23 @@ struct SlideshowState {
     slideshow_condvar: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
 }
 
+#[derive(Clone)]
+struct FrameBufferInfo {
+    width: u32,
+    height: u32,
+    bytes_per_line: u32,
+    bits_per_pixel: u32,
+}
+
+#[derive(Clone)]
+struct FrameBufferState {
+    mmap: Arc<Mutex<MmapMut>>,
+    fb_info: FrameBufferInfo,
+    fb_idx: Arc<AtomicUsize>,
+    fb_file: Arc<Mutex<File>>,
+    var_screen_info: Arc<Mutex<framebuffer::VarScreeninfo>>,
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 3 || args[1] != "-c" {
@@ -97,12 +111,12 @@ fn main() {
         std::process::exit(1);
     }
 
-    let fb_info = get_framebuffer_info().expect("Failed to get framebuffer info");
 
     // initialize data containers
     // lock order: config -> image_list
     let config = Arc::new(Config::new(&args[2]));
-    let state = Arc::new(SlideshowState {
+    let fb_state = Arc::new(setup_framebuffer());
+    let slideshow_state = Arc::new(SlideshowState {
         paused: Arc::new(AtomicBool::new(false)),
         current_index: Arc::new(AtomicUsize::new(0)),
         image_list_len: Arc::new(AtomicUsize::new(0)),
@@ -114,32 +128,32 @@ fn main() {
 
     // Spawn a new thread to run the warp server
     let port = config.http_server_port.load(std::sync::atomic::Ordering::Relaxed);
-    let state_clone = state.clone();
+    let slideshow_state_clone = slideshow_state.clone();
     let config_clone = config.clone();
     std::thread::spawn(move || {
         let rx_clone = Arc::new(Mutex::new(rx));
         rouille::start_server(format!("0.0.0.0:{}", port), move |request| {
-            setup_routes(request, state_clone.clone(), config_clone.clone(), rx_clone.clone())
+            setup_routes(request, slideshow_state_clone.clone(), config_clone.clone(), rx_clone.clone())
         });
     });
 
     // Create a new thread to increase the index with configured interval
-    let state_clone = state.clone();
+    let slideshow_state_clone = slideshow_state.clone();
     let config_clone = config.clone();
     std::thread::spawn(move || {
         loop {
             let sleep_interval = config_clone.interval.load(std::sync::atomic::Ordering::Relaxed) as u64;
             std::thread::sleep(std::time::Duration::from_secs(sleep_interval));
-            maybe_increase_index(&state_clone);
-            println!("index: {}", state_clone.current_index.load(std::sync::atomic::Ordering::Relaxed));
+            maybe_increase_index(&slideshow_state_clone);
+            println!("index: {}", slideshow_state_clone.current_index.load(std::sync::atomic::Ordering::Relaxed));
         }
     });
 
     // Run the slideshow loop
-    let state_clone = state.clone();
+    let slideshow_state_clone = slideshow_state.clone();
     let config_clone = config.clone();
     std::thread::spawn(move || {
-        run_slideshow(fb_info, state_clone, config_clone, tx);
+        run_slideshow(fb_state, slideshow_state_clone, config_clone, tx);
     });
 
     // Keep the main function alive
@@ -148,57 +162,91 @@ fn main() {
     }
 }
 
+fn setup_framebuffer() -> FrameBufferState {
+    let framebuffer_path = "/dev/fb0";
+    let path = PathBuf::from(framebuffer_path);
+    let file = OpenOptions::new().read(true).write(true).create(true).open(path).expect("Failed to open fb file");
+    //let screeninfo =  framebuffer::VarScreeninfo { xres: 3840, yres: 2160, xres_virtual: 3840, yres_virtual: 2160, xoffset: 0, yoffset: 0, bits_per_pixel: 32, grayscale: 0, red: framebuffer::Bitfield { offset: 16, length: 8, msb_right: 0 }, green: framebuffer::Bitfield { offset: 8, length: 8, msb_right: 0 }, blue: framebuffer::Bitfield { offset: 0, length: 8, msb_right: 0 }, transp: framebuffer::Bitfield { offset: 24, length: 8, msb_right: 0 }, nonstd: 0, activate: 0, height: 0, width: 0, accel_flags: 1, pixclock: 0, left_margin: 0, right_margin: 0, upper_margin: 0, lower_margin: 0, hsync_len: 0, vsync_len: 0, sync: 0, vmode: 512, rotate: 0, colorspace: 0, reserved: [0, 0, 0, 0] };
+    let mut screeninfo = framebuffer::Framebuffer::get_var_screeninfo(&file).expect("failed to get var_screen_info");
+    screeninfo.yres_virtual = screeninfo.yres * FB_NUM_BUFFERS as u32;
+    println!("screeninfo: {:?}", screeninfo);
+    // write framebuffer info
+    framebuffer::Framebuffer::put_var_screeninfo(&file, &screeninfo).expect("failed to put var_screen_info");
+    let fbinfo = FrameBufferInfo {
+        width: screeninfo.xres,
+        height: screeninfo.yres,
+        bytes_per_line: screeninfo.xres * screeninfo.bits_per_pixel / 8,
+        bits_per_pixel: screeninfo.bits_per_pixel,
+    };
+    // setup mmap for framebuffer
+    let framebuffer_size = fbinfo.bytes_per_line as usize * fbinfo.height as usize;
+    // double buffer, so size should be FB_NUM_BUFFERS x screen pixel sizes
+    let mmap = unsafe { MmapOptions::new().len(framebuffer_size * FB_NUM_BUFFERS).populate().map_mut(&file).expect("Failed to mmap fb") };
+    #[cfg(unix)]
+    {
+        mmap.advise(memmap2::Advice::Sequential).expect("Failed to advise mmap");
+        mmap.advise(memmap2::Advice::DontFork).expect("Failed to advise mmap");
+    }
+    FrameBufferState {
+        mmap: Arc::new(Mutex::new(mmap)),
+        fb_info: fbinfo,
+        fb_idx: Arc::new(AtomicUsize::new(0)),
+        fb_file: Arc::new(Mutex::new(file)),
+        var_screen_info: Arc::new(Mutex::new(screeninfo)),
+    }
+}
+
 // currently there is no lock or mutex to protect the opreations
 // the user needs to take care by themselves.
 // e.g. don't rescan when uploading, or don't continue/prev/next/seek when rescnaning
-fn setup_routes(request: &Request, state: Arc<SlideshowState>, config: Arc<Config>, rx: Arc<Mutex<Receiver<String>>>) -> Response {
+fn setup_routes(request: &Request, slideshow_state: Arc<SlideshowState>, config: Arc<Config>, rx: Arc<Mutex<Receiver<String>>>) -> Response {
     rouille::router!(request,
         // usage: http://serverhost/pause -> pause the slideshow loop
         (GET) (/pause) => {
-            state.paused.store(true, Ordering::Relaxed);
+            slideshow_state.paused.store(true, Ordering::Relaxed);
             Response::json(&"Paused")
         },
         // usage: http://serverhost/resume -> resume the slideshow loop
         (GET) (/resume) => {
-            state.paused.store(false, Ordering::Relaxed);
+            slideshow_state.paused.store(false, Ordering::Relaxed);
             // awake the slideshow loop
-            state.slideshow_condvar.1.notify_one();
+            slideshow_state.slideshow_condvar.1.notify_one();
             Response::json(&"Resumed")
         },
         // usage: http://serverhost/prev -> move to the previous image
         (GET) (/prev) => {
-            let image_list_len = state.image_list_len.load(Ordering::Relaxed);
+            let image_list_len = slideshow_state.image_list_len.load(Ordering::Relaxed);
             if image_list_len > 0 {
-                let current_index_value = state.current_index.load(Ordering::Relaxed);
+                let current_index_value = slideshow_state.current_index.load(Ordering::Relaxed);
                 let new_index_value = (current_index_value + image_list_len - 1) % image_list_len;
-                state.current_index.store(new_index_value, Ordering::Relaxed);
+                slideshow_state.current_index.store(new_index_value, Ordering::Relaxed);
                 // awake the slideshow loop
-                state.slideshow_condvar.1.notify_one();
+                slideshow_state.slideshow_condvar.1.notify_one();
             }
             Response::json(&"Previous")
         },
         // usage: http://serverhost/next -> move to the next image
         (GET) (/next) => {
-            let image_list_len = state.image_list_len.load(Ordering::Relaxed);
+            let image_list_len = slideshow_state.image_list_len.load(Ordering::Relaxed);
             if image_list_len > 0 {
-                let current_index_value = state.current_index.load(Ordering::Relaxed);
+                let current_index_value = slideshow_state.current_index.load(Ordering::Relaxed);
                 let new_index_value = (current_index_value + 1) % image_list_len;
-                state.current_index.store(new_index_value, Ordering::Relaxed);
+                slideshow_state.current_index.store(new_index_value, Ordering::Relaxed);
                 // awake the slideshow loop
-                state.slideshow_condvar.1.notify_one();
+                slideshow_state.slideshow_condvar.1.notify_one();
             }
             Response::json(&"Next")
         },
         // usage: http://serverhost/rescan -> rescan the folder for new images
         (GET) (/rescan) => {
-            state.need_rescan.store(true, Ordering::Relaxed);
+            slideshow_state.need_rescan.store(true, Ordering::Relaxed);
             // awake the slideshow loop
-            state.slideshow_condvar.1.notify_one();
+            slideshow_state.slideshow_condvar.1.notify_one();
             let start = std::time::Instant::now();
-            while state.need_rescan.load(Ordering::Relaxed) {
+            while slideshow_state.need_rescan.load(Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 if start.elapsed().as_secs() > 180 {
-                    state.need_rescan.store(false, Ordering::Relaxed);
+                    slideshow_state.need_rescan.store(false, Ordering::Relaxed);
                     return Response::json(&"Rescan failed, 180s timeout");
                 }
             }
@@ -211,28 +259,28 @@ fn setup_routes(request: &Request, state: Arc<SlideshowState>, config: Arc<Confi
         },
         // usage: http://serverhost/seek/{index} -> seek to the specified index
         (GET) (/seek/{index: usize}) => {
-            let image_list_len = state.image_list_len.load(Ordering::Relaxed);
+            let image_list_len = slideshow_state.image_list_len.load(Ordering::Relaxed);
             if index >= image_list_len {
                 return Response::json(&"Index out of range");
             }
-            state.current_index.store(index, Ordering::Relaxed);
+            slideshow_state.current_index.store(index, Ordering::Relaxed);
             // awake the slideshow loop
-            state.slideshow_condvar.1.notify_one();
+            slideshow_state.slideshow_condvar.1.notify_one();
             Response::json(&"Seeked")
         },
         // usage: http://serverhost/query -> query the current image name
         (GET) (/query) => {
-            state.need_query.store(true, Ordering::Relaxed);
+            slideshow_state.need_query.store(true, Ordering::Relaxed);
             // awake the slideshow loop
-            state.slideshow_condvar.1.notify_one();
+            slideshow_state.slideshow_condvar.1.notify_one();
             let image_name = rx.lock().recv().unwrap();
             Response::json(&format!("Image name: {}", image_name))
         },
         // usage: http://serverhost/clearfolder -> clear the folder
         (GET) (/clearfolder) => {
-            state.paused.store(true, Ordering::Relaxed);
-            state.image_list_len.store(0, Ordering::Relaxed);
-            state.current_index.store(0, Ordering::Relaxed);
+            slideshow_state.paused.store(true, Ordering::Relaxed);
+            slideshow_state.image_list_len.store(0, Ordering::Relaxed);
+            slideshow_state.current_index.store(0, Ordering::Relaxed);
 
             let folder_path = config.folder_path.read().unwrap().clone();
             for entry in fs::read_dir(&folder_path).unwrap() {
@@ -253,7 +301,7 @@ fn setup_routes(request: &Request, state: Arc<SlideshowState>, config: Arc<Confi
             let mut body = Vec::new();
             data.take(10 * 1024 * 1024).read_to_end(&mut body).unwrap(); // limit to 10MB
 
-            state.paused.store(true, Ordering::Relaxed);
+            slideshow_state.paused.store(true, Ordering::Relaxed);
             let folder_path = config.folder_path.read().unwrap().clone();
             let image_path = Path::new(&folder_path).join(&image_name);
 
@@ -271,22 +319,22 @@ fn setup_routes(request: &Request, state: Arc<SlideshowState>, config: Arc<Confi
         _ => Response::empty_404()
     )
 }
-fn maybe_increase_index(state: &Arc<SlideshowState>) {
-    let current_index = state.current_index.load(std::sync::atomic::Ordering::Relaxed);
-    let image_list_len = state.image_list_len.load(std::sync::atomic::Ordering::Relaxed);
-    let paused = state.paused.load(std::sync::atomic::Ordering::Relaxed);
+fn maybe_increase_index(slideshow_state: &Arc<SlideshowState>) {
+    let current_index = slideshow_state.current_index.load(std::sync::atomic::Ordering::Relaxed);
+    let image_list_len = slideshow_state.image_list_len.load(std::sync::atomic::Ordering::Relaxed);
+    let paused = slideshow_state.paused.load(std::sync::atomic::Ordering::Relaxed);
     if image_list_len != 0 && !paused {
         let new_index = (current_index + 1 + image_list_len) % image_list_len;
-        state.current_index.store(new_index, std::sync::atomic::Ordering::Relaxed);
+        slideshow_state.current_index.store(new_index, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
 // main "event loop" for the slideshow
 fn run_slideshow(
-    fb_info: FramebufferInfo,
-    state: Arc<SlideshowState>,
+    fb_state: Arc<FrameBufferState>,
+    slideshow_state: Arc<SlideshowState>,
     config: Arc<Config>, 
-    tx: std::sync::mpsc::Sender<String>
+    tx: std::sync::mpsc::Sender<String>,
 ) {
     // private image list inside run_slideshow, won't share it
     let mut image_list: Vec<(PathBuf, ImageFormat)> = Vec::new();
@@ -294,15 +342,15 @@ fn run_slideshow(
     let mut current_index_last_time = None;
     let mut terminal_signal = Arc::new(AtomicBool::new(false));
     loop {
-        let current_index = state.current_index.load(std::sync::atomic::Ordering::Relaxed);
-        let image_list_len = state.image_list_len.load(std::sync::atomic::Ordering::Relaxed);
-        let needs_rescan = state.need_rescan.load(std::sync::atomic::Ordering::Relaxed);
-        let needs_query = state.need_query.load(std::sync::atomic::Ordering::Relaxed);
-        let slideshow_condvar_pair = state.slideshow_condvar.clone();
+        let current_index = slideshow_state.current_index.load(std::sync::atomic::Ordering::Relaxed);
+        let image_list_len = slideshow_state.image_list_len.load(std::sync::atomic::Ordering::Relaxed);
+        let needs_rescan = slideshow_state.need_rescan.load(std::sync::atomic::Ordering::Relaxed);
+        let needs_query = slideshow_state.need_query.load(std::sync::atomic::Ordering::Relaxed);
+        let slideshow_condvar_pair = slideshow_state.slideshow_condvar.clone();
 
         // response to the query request
         if needs_query {
-            state.need_query.store(false, std::sync::atomic::Ordering::Relaxed);
+            slideshow_state.need_query.store(false, std::sync::atomic::Ordering::Relaxed);
             if image_list_len == 0 {
                 tx.send(String::from("Image list is Empty")).unwrap();
             } else if current_index >= image_list_len {
@@ -315,8 +363,8 @@ fn run_slideshow(
         // if needs rescan, re-init image_list
         if needs_rescan {
             let scan_folder_path = config.folder_path.read().unwrap().clone();
-            state.need_rescan.store(false, std::sync::atomic::Ordering::Relaxed);
-            image_list = scan_folder(&scan_folder_path, state.clone());
+            slideshow_state.need_rescan.store(false, std::sync::atomic::Ordering::Relaxed);
+            image_list = scan_folder(&scan_folder_path, slideshow_state.clone());
             continue;
         }
 
@@ -336,7 +384,7 @@ fn run_slideshow(
 
         // if the current index is greater than the length of the image list, reset the index to 0
         if current_index >= image_list_len {
-            state.current_index.store(0, std::sync::atomic::Ordering::Relaxed);
+            slideshow_state.current_index.store(0, std::sync::atomic::Ordering::Relaxed);
             continue;
         }
 
@@ -357,19 +405,19 @@ fn run_slideshow(
             if Some(()) == match format {
                 ImageFormat::Gif => {
                     let cloned_config = config.clone();
-                    let cloned_fb_info = fb_info.clone();
+                    let cloned_fb_state = fb_state.clone();
                     let cloned_terminal_signal = terminal_signal.clone();
                     std::thread::spawn(move || {
-                        display_gif(&path, cloned_config, &cloned_fb_info, &bar_text, cloned_terminal_signal);
+                        display_gif(&path, cloned_config, cloned_fb_state, &bar_text, cloned_terminal_signal);
                     });
                     Some(())
                 },
                 ImageFormat::WebP => {
                     let cloned_config = config.clone();
-                    let cloned_fb_info = fb_info.clone();
+                    let cloned_fb_state = fb_state.clone();
                     let cloned_terminal_signal = terminal_signal.clone();
                     std::thread::spawn(move || {
-                        display_single_img(&path, format, cloned_config, &cloned_fb_info, &bar_text, cloned_terminal_signal);
+                        display_single_img(&path, format, cloned_config, cloned_fb_state, &bar_text, cloned_terminal_signal);
                     });
                     Some(())
                 }
@@ -382,7 +430,7 @@ fn run_slideshow(
 
         // else the image is not found or not supported
         // increase the index immediately
-        maybe_increase_index(&state)
+        maybe_increase_index(&slideshow_state)
     }
 }
 
@@ -394,10 +442,10 @@ fn sleep_slideshow(slideshow_condvar_pair: Arc<(std::sync::Mutex<bool>, std::syn
     let _ = condvar.wait_timeout(_guard, duration);
 }
 
-fn scan_folder(scan_folder_path: &str, state: Arc<SlideshowState>) -> Vec<(PathBuf, ImageFormat)> {
+fn scan_folder(scan_folder_path: &str, slideshow_state: Arc<SlideshowState>) -> Vec<(PathBuf, ImageFormat)> {
     // pause the slideshow first
-    let pause_value = state.paused.load(std::sync::atomic::Ordering::Relaxed);
-    state.paused.store(true, std::sync::atomic::Ordering::Relaxed);
+    let pause_value = slideshow_state.paused.load(std::sync::atomic::Ordering::Relaxed);
+    slideshow_state.paused.store(true, std::sync::atomic::Ordering::Relaxed);
 
     let image_list : Vec<(PathBuf, ImageFormat)> = WalkDir::new(scan_folder_path)
         .into_iter()
@@ -408,60 +456,10 @@ fn scan_folder(scan_folder_path: &str, state: Arc<SlideshowState>) -> Vec<(PathB
             get_image_format(&path).map(|format| (path.to_path_buf(), format))
         })
         .collect();
-    state.image_list_len.store(image_list.len(), std::sync::atomic::Ordering::Relaxed);
-    state.current_index.store(0, std::sync::atomic::Ordering::Relaxed);
-    state.paused.store(pause_value, std::sync::atomic::Ordering::Relaxed);
+    slideshow_state.image_list_len.store(image_list.len(), std::sync::atomic::Ordering::Relaxed);
+    slideshow_state.current_index.store(0, std::sync::atomic::Ordering::Relaxed);
+    slideshow_state.paused.store(pause_value, std::sync::atomic::Ordering::Relaxed);
     image_list
-}
-
-fn get_framebuffer_info() -> io::Result<FramebufferInfo> {
-    // check framebuffer size
-    // the file content looks like: 1024, 768
-    let mut fb_var_screeninfo_size = File::open("/sys/class/graphics/fb0/virtual_size")?;
-    let mut content = String::new();
-    fb_var_screeninfo_size.read_to_string(&mut content)?;
-    let dimensions: Vec<&str> = content.trim().split(',').collect();
-    if dimensions.len() != 2 {
-        eprintln!("Unexpected format in virtual_size file");
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid format"));
-    }
-
-    let width: u32 = match dimensions[0].trim().parse() {
-        Ok(w) => w,
-        Err(_) => {
-            eprintln!("Failed to parse width");
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid width"));
-        }
-    };
-
-    let height: u32 = match dimensions[1].trim().parse() {
-        Ok(h) => h,
-        Err(_) => {
-            eprintln!("Failed to parse height");
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid height"));
-        }
-    };
-    // file content looks like: 32
-    let mut fb_var_screeninfo_bits_per_pixel = File::open("/sys/class/graphics/fb0/bits_per_pixel")?;
-    let bits_per_pixel: u32 = {
-        let mut content = String::new();
-        fb_var_screeninfo_bits_per_pixel.read_to_string(&mut content)?;
-        content.trim().parse().unwrap()
-    };
-    let mut fb_var_screeninfo_stride = File::open("/sys/class/graphics/fb0/stride")?;
-    let stride: u32 = {
-        let mut content = String::new();
-        fb_var_screeninfo_stride.read_to_string(&mut content)?;
-        content.trim().parse().unwrap()
-    };
-
-
-    Ok(FramebufferInfo {
-        width: width,
-        height: height,
-        bytes_per_line: stride, 
-        bits_per_pixel: bits_per_pixel,
-    })
 }
 
 fn get_image_format(path: &Path) -> Option<ImageFormat> {
@@ -476,26 +474,27 @@ fn get_image_format(path: &Path) -> Option<ImageFormat> {
     }
 }
 
-fn display_image(img: &DynamicImage, resize_algorithm : ResizeAlg , config : Arc<Config>, fb_info: &FramebufferInfo, status_text: &str) {
+fn display_image(img: &DynamicImage, resize_algorithm : ResizeAlg , config : Arc<Config>, fb_state: Arc<FrameBufferState>, status_text: &str) {
     // read the image with the specified format
     let start = std::time::Instant::now();
+    let fb_info = fb_state.fb_info.clone();
     if resize_algorithm != ResizeAlg::Nearest {
-        let img = resize_image(&img, fb_info, config.clone(), resize_algorithm);
+        let img = resize_image(&img, &fb_info, config.clone(), resize_algorithm);
         let elapsed = start.elapsed();
         println!("Resizing Elapsed: {:?}", elapsed);
         // Combine the resized image and the status bar
-        write_to_framebuffer(&img, &status_text, fb_info, config.clone(), 1);
+        write_to_framebuffer(&img, &status_text, fb_state, config.clone(), 1);
     } else {
         println!("Skip Resizing");
         let scale_x = fb_info.width as f32 / img.width() as f32;
         let scale_y = fb_info.height as f32 / img.height() as f32;
         let scale = scale_x.min(scale_y).floor() as u32;
         // skip resizing and do integer-factor resize in the fb write
-        write_to_framebuffer(&img, &status_text, fb_info, config.clone(), scale);
+        write_to_framebuffer(&img, &status_text, fb_state, config.clone(), scale);
     }
 }
 
-fn resize_image(img: &DynamicImage, fb_info: &FramebufferInfo, config: Arc<Config>, algorithm: ResizeAlg) -> DynamicImage {
+fn resize_image(img: &DynamicImage, fb_info: &FrameBufferInfo, config: Arc<Config>, algorithm: ResizeAlg) -> DynamicImage {
     let ratio = img.width() as f32 / img.height() as f32;
     let status_bar_height = config.status_bar_height.load(std::sync::atomic::Ordering::Relaxed);
     let new_height = fb_info.height - status_bar_height;
@@ -512,7 +511,7 @@ fn resize_image(img: &DynamicImage, fb_info: &FramebufferInfo, config: Arc<Confi
     }
 }
 
-fn draw_statusbar_text(raw_mem: &mut [u8], fb_info: &FramebufferInfo,config: Arc<Config>, status_text: &str) {
+fn draw_statusbar_text(raw_mem: &mut [u8], fb_info: &FrameBufferInfo,config: Arc<Config>, status_text: &str) {
     // Create a new image for the status bar only
     let bytes_per_pixel = (fb_info.bits_per_pixel / 8) as i32;
 
@@ -617,7 +616,7 @@ fn convert_rgba_or_rgb_to_bgr(img: DynamicImage) -> DynamicImage {
     img
 }
 
-fn display_single_img(path: &Path, format: ImageFormat, config: Arc<Config>, fb_info: &FramebufferInfo, status_text: &str, terminal_signal: Arc<AtomicBool>) {
+fn display_single_img(path: &Path, format: ImageFormat, config: Arc<Config>, fb_state: Arc<FrameBufferState>, status_text: &str, terminal_signal: Arc<AtomicBool>) {
     if let Ok(img) = image::open(path) {
         println!("image format: {:?}", format);
         println!("image color: {:?}", img.color());
@@ -631,17 +630,19 @@ fn display_single_img(path: &Path, format: ImageFormat, config: Arc<Config>, fb_
         // if terminal_signal is true, skip loading image and early return
         if terminal_signal.load(std::sync::atomic::Ordering::Relaxed) { return; }
 
-        display_image(&img, ResizeAlg::Convolution(FilterType::Mitchell), config, fb_info, status_text)
+        display_image(&img, ResizeAlg::Convolution(FilterType::Mitchell), config, fb_state, status_text)
     }
 }
 
-fn display_gif(path: &Path, config: Arc<Config>, fb_info: &FramebufferInfo, status_text: &str, terminal_signal: Arc<AtomicBool>) {
+fn display_gif(path: &Path, config: Arc<Config>, fb_state: Arc<FrameBufferState>, status_text: &str, terminal_signal: Arc<AtomicBool>) {
     if let Ok(file) = File::open(path) {
         let file_in = io::BufReader::new(file);
         let decoder = GifDecoder::new(file_in).unwrap();
         let mut frames = decoder.into_frames();
         let mut img_vec = Vec::new();
         let mut img_vec_idx = 0;
+        let max_fps = config.max_fps.load(std::sync::atomic::Ordering::Relaxed) as f32;
+        let fps_delay = Duration::from_secs_f32(1.0 / max_fps);
 
         loop {
             // if terminal_signal is true, skip loading image and early return
@@ -649,7 +650,7 @@ fn display_gif(path: &Path, config: Arc<Config>, fb_info: &FramebufferInfo, stat
 
             // decode the next frame
             let start = std::time::Instant::now();
-            let (img, delay) = if let Some(Ok(frame)) = frames.next() {
+            let (img, gif_delay) = if let Some(Ok(frame)) = frames.next() {
                 // the frames is not empty, retrieve a new frame and display it
                 // cache it in the img_vec
                 let delay = frame.delay();
@@ -670,13 +671,14 @@ fn display_gif(path: &Path, config: Arc<Config>, fb_info: &FramebufferInfo, stat
             // if terminal_signal is true, skip loading image and early return
             if terminal_signal.load(std::sync::atomic::Ordering::Relaxed) { return; }
 
-            display_image(&img, ResizeAlg::Nearest, Arc::clone(&config), fb_info, status_text);
+            display_image(&img, ResizeAlg::Nearest, Arc::clone(&config), fb_state.clone(), status_text);
 
             // if terminal_signal is true, skip loading image and early return
             if terminal_signal.load(std::sync::atomic::Ordering::Relaxed) { return; }
 
             // Sleep for the delay time
             let elapsed = start.elapsed();
+            let delay = fps_delay.max(Duration::from(gif_delay));
             if Duration::from(delay) > elapsed {
                 thread::sleep(Duration::from(delay) - elapsed);
             }
@@ -684,18 +686,18 @@ fn display_gif(path: &Path, config: Arc<Config>, fb_info: &FramebufferInfo, stat
     }
 }
 
-fn write_to_framebuffer(img: &DynamicImage, status_text: &str, fb_info: &FramebufferInfo, config: Arc<Config>, scale: u32) {
+fn write_to_framebuffer(img: &DynamicImage, status_text: &str, fb_state: Arc<FrameBufferState>, config: Arc<Config>, scale: u32) {
     // Time it
-    let framebuffer_path = "/dev/fb0";
+    let fb_info = fb_state.fb_info.clone();
     let bytes_per_pixel = (fb_info.bits_per_pixel / 8) as usize;
     let bytes_per_line = fb_info.bytes_per_line as usize;
     let fb_height = fb_info.height as usize;
     let fb_width = fb_info.width as usize;
 
-    let path = PathBuf::from(framebuffer_path);
-    let file = OpenOptions::new().read(true).write(true).create(true).open(path).expect("Failed to open fb file");
-    let framebuffer_size = bytes_per_line as usize * fb_height as usize;
-    let mut mmap = unsafe { MmapOptions::new().len(framebuffer_size).map_mut(&file).expect("Failed to mmap fb") };
+    let fb_size = bytes_per_line as usize * fb_height as usize;
+    let fb_idx = fb_state.fb_idx.load(std::sync::atomic::Ordering::Relaxed);
+    let mut mmap_unlock = fb_state.mmap.lock();
+    let mmap = &mut mmap_unlock[fb_idx * fb_size..(fb_idx + 1) * fb_size];
 
     let status_bar_height = config.status_bar_height.load(std::sync::atomic::Ordering::Relaxed) as usize;
 
@@ -712,7 +714,6 @@ fn write_to_framebuffer(img: &DynamicImage, status_text: &str, fb_info: &Framebu
     let end_x = (start_x + img_width * scale).min(fb_width);
     let end_y = (start_y + img_height * scale).min(fb_height - status_bar_height - 16); // The raspberrypi have some error at the screen corner, move the status bar up a bit
 
-
     // If image is not type Rgb8 (actually bgr8), warning
     if img.color() != image::ColorType::Rgb8 {
         println!("Warning: image color type is not Rgb8(BGR8)");
@@ -725,37 +726,39 @@ fn write_to_framebuffer(img: &DynamicImage, status_text: &str, fb_info: &Framebu
     // draw the image
     let image_buffer = &mut mmap[start_y * bytes_per_line..(start_y + img_height * scale) * bytes_per_line];
     // draw the image line by line, parallelize the drawing, combine several lines as a batch
-    image_buffer.par_chunks_mut(scale * bytes_per_line).enumerate().for_each(|(y, target_line_chunk)| {
-        // locate the original image line
-        let y_src = y;
-        if y_src >= img_height {
-            return;
-        }
-        // use local memory buffer to store the line data
-        let mut line_buffer = vec![0u8; bytes_per_line];
-        // draw the first target line
-        // draw the white space at the beggining of the line
-        line_buffer[0..start_x as usize * bytes_per_pixel].fill(0xFFu8);
-        // calculate the offset in the image raw data
-        let src_y_offset = y_src as usize * img_width as usize * 3;
-        for x in 0..img_width {
-            let src_x_offset = x as usize * 3;
-            let pixel = &img_raw[src_y_offset + src_x_offset..src_y_offset + src_x_offset + 3];
-            // repeat pixels scale times in the target line
-            for j_repeat in 0..scale {
-                let dest_x_offset = (start_x + scale * x + j_repeat) as usize * bytes_per_pixel;
-                line_buffer[dest_x_offset..dest_x_offset + 3].copy_from_slice(pixel);
+    {
+        image_buffer.par_chunks_mut(scale * bytes_per_line).enumerate().for_each(|(y, target_line_chunk)| {
+            // locate the original image line
+            let y_src = y;
+            if y_src >= img_height {
+                return;
             }
-        }
-        // draw the white space at the end of the line
-        line_buffer[end_x * bytes_per_pixel..].fill(0xFFu8);
-    
-        // copy the first target line to the rest of the lines in the chunk
-        for j_repeat in 0..scale {
-            let target_line = &mut target_line_chunk[j_repeat * bytes_per_line..(j_repeat + 1) * bytes_per_line];
-            target_line.copy_from_slice(&line_buffer);
-        }
-    });
+            // use local memory buffer to store the line data
+            let mut line_buffer = vec![0u8; bytes_per_line];
+            // draw the first target line
+            // draw the white space at the beggining of the line
+            line_buffer[0..start_x as usize * bytes_per_pixel].fill(0xFFu8);
+            // calculate the offset in the image raw data
+            let src_y_offset = y_src as usize * img_width as usize * 3;
+            for x in 0..img_width {
+                let src_x_offset = x as usize * 3;
+                let pixel = &img_raw[src_y_offset + src_x_offset..src_y_offset + src_x_offset + 3];
+                // repeat pixels scale times in the target line
+                for j_repeat in 0..scale {
+                    let dest_x_offset = (start_x + scale * x + j_repeat) as usize * bytes_per_pixel;
+                    line_buffer[dest_x_offset..dest_x_offset + 3].copy_from_slice(pixel);
+                }
+            }
+            // draw the white space at the end of the line
+            line_buffer[end_x * bytes_per_pixel..].fill(0xFFu8);
+        
+            // copy the first target line to the rest of the lines in the chunk
+            for j_repeat in 0..scale {
+                let target_line = &mut target_line_chunk[j_repeat * bytes_per_line..(j_repeat + 1) * bytes_per_line];
+                target_line.copy_from_slice(&line_buffer);
+            }
+        });
+    }
 
     // draw the white space last, including the status bar area as background
     mmap[end_y * bytes_per_line..(fb_height - status_bar_height - 16) * bytes_per_line].fill(0xFFu8); // The raspberrypi have some error at the screen corner, move the status bar up a bit
@@ -769,13 +772,28 @@ fn write_to_framebuffer(img: &DynamicImage, status_text: &str, fb_info: &Framebu
     // Prepare buffer according to framebuffer's pixel layout
     let start = std::time::Instant::now();
     let mut statusbar_buffer = vec![0xFFu8; status_bar_height * bytes_per_line];
-    draw_statusbar_text(&mut statusbar_buffer, fb_info, config, status_text);
+    draw_statusbar_text(&mut statusbar_buffer, &fb_info, config, status_text);
     let statusbar_target = &mut mmap[y_offset..y_offset + status_bar_height * bytes_per_line];
     statusbar_target.copy_from_slice(&statusbar_buffer);
 
     let elapsed = start.elapsed();
     println!("Drawing status bar Elapsed: {:?}", elapsed);
+
+    let start = std::time::Instant::now();
+    println!("fb_idx: {}", fb_idx);
     // flush the data to the framebuffer
-    //mmap.flush_async_range(0, framebuffer_size).expect("Failed to flush data");
-    //mmap.flush().expect("Failed to flush data");
+    mmap_unlock.flush_range(fb_idx * fb_size, fb_size).expect("Failed to flush data");
+    // switch fb offset to the drawn frame
+    {
+        let fb_file = fb_state.fb_file.lock();
+        let mut var_screen_info = fb_state.var_screen_info.lock();
+        var_screen_info.yoffset = (fb_idx * fb_height) as u32;
+        framebuffer::Framebuffer::pan_display(&fb_file, &var_screen_info).expect("Failed to pan display");
+    }
+
+    // switch fb idx
+    fb_state.fb_idx.fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |x| Some((x + 1) % FB_NUM_BUFFERS)).unwrap();
+
+    let elapsed = start.elapsed();
+    println!("Flushing to fb Elapsed: {:?}", elapsed);
 }
