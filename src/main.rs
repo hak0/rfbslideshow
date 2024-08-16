@@ -4,7 +4,7 @@ use image::{DynamicImage, GenericImageView, ImageFormat, Rgb, AnimationDecoder};
 use rusttype::{Font, Scale};
 use serde::Deserialize;
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
@@ -15,6 +15,8 @@ use std::time::Duration;
 use jwalk::WalkDir;
 use rayon::prelude::*;
 use rouille::{Request, Response};
+use std::fs::OpenOptions;
+use memmap2::MmapOptions;
 
 
 
@@ -491,9 +493,6 @@ fn display_image(img: &DynamicImage, resize_algorithm : ResizeAlg , config : Arc
         // skip resizing and do integer-factor resize in the fb write
         write_to_framebuffer(&img, &status_text, fb_info, config.clone(), scale);
     }
-
-
-
 }
 
 fn resize_image(img: &DynamicImage, fb_info: &FramebufferInfo, config: Arc<Config>, algorithm: ResizeAlg) -> DynamicImage {
@@ -513,7 +512,7 @@ fn resize_image(img: &DynamicImage, fb_info: &FramebufferInfo, config: Arc<Confi
     }
 }
 
-fn draw_statusbar_text(raw_mem: &mut Vec<u8>, fb_info: &FramebufferInfo,config: Arc<Config>, status_text: &str) {
+fn draw_statusbar_text(raw_mem: &mut [u8], fb_info: &FramebufferInfo,config: Arc<Config>, status_text: &str) {
     // Create a new image for the status bar only
     let bytes_per_pixel = (fb_info.bits_per_pixel / 8) as i32;
 
@@ -689,135 +688,94 @@ fn write_to_framebuffer(img: &DynamicImage, status_text: &str, fb_info: &Framebu
     // Time it
     let framebuffer_path = "/dev/fb0";
     let bytes_per_pixel = (fb_info.bits_per_pixel / 8) as usize;
+    let bytes_per_line = fb_info.bytes_per_line as usize;
+    let fb_height = fb_info.height as usize;
+    let fb_width = fb_info.width as usize;
 
-    let framebuffer = Arc::new(Mutex::new(File::create(framebuffer_path).expect("Failed to open framebuffer")));
+    let path = PathBuf::from(framebuffer_path);
+    let file = OpenOptions::new().read(true).write(true).create(true).open(path).expect("Failed to open fb file");
+    let framebuffer_size = bytes_per_line as usize * fb_height as usize;
+    let mut mmap = unsafe { MmapOptions::new().len(framebuffer_size).map_mut(&file).expect("Failed to mmap fb") };
 
-    let status_bar_height = config.status_bar_height.load(std::sync::atomic::Ordering::Relaxed);
+    let status_bar_height = config.status_bar_height.load(std::sync::atomic::Ordering::Relaxed) as usize;
 
     let start = std::time::Instant::now();
     // Draw Image line-by-line
     let (img_width, img_height) = img.dimensions();
-    if scale == 1 {
-        // To draw the image at 2/3 of the screen width, calculate the starting position
-        let x_offset_ratio = 2.0 / 3.0;
-        let start_x = ((fb_info.width as f32 * x_offset_ratio) - (img_width as f32 * x_offset_ratio)) as u32;
-        let start_y = (fb_info.height - img_height - status_bar_height) / 2;
+    let img_width = img_width as usize;
+    let img_height = img_height as usize;
+    let scale = scale as usize;
+    // To draw the image at 2/3 of the screen width, calculate the starting position
+    let x_offset_ratio = 2.0 / 3.0;
+    let start_x = ((fb_width as f32 * x_offset_ratio) - (scale as f32 * img_width as f32 * x_offset_ratio)) as usize;
+    let start_y = (fb_height - scale * img_height - status_bar_height) / 2;
+    let end_x = (start_x + img_width * scale).min(fb_width);
+    let end_y = (start_y + img_height * scale).min(fb_height - status_bar_height - 16); // The raspberrypi have some error at the screen corner, move the status bar up a bit
 
-        // If image is not type Rgb8 (actually bgr8), warning
-        if img.color() != image::ColorType::Rgb8 {
-            println!("Warning: image color type is not Rgb8(BGR8)");
-        }
 
-        let img_raw = img.as_rgb8().unwrap().as_raw();
-        let framebuffer_clone = Arc::clone(&framebuffer);
-
-        // draw the image line-by-line, but draw multiple lines at once to reduce the number of write calls
-        let line_batch = rayon::current_num_threads();
-        println!("line_batch: {}", line_batch);
-        (0..img_height.min(fb_info.height)).into_par_iter().step_by(line_batch).for_each(|y| {
-            let mut line_buffer = vec![0xFFu8; fb_info.bytes_per_line as usize * line_batch];
-            for i in 0..line_batch {
-                let y = y as usize;
-                let yi = y + i;
-                if yi >= img_height.min(fb_info.height) as usize{
-                    break;
-                }
-                // Extract the line from the image's raw data
-                let src_y_offset = yi as usize * img_width as usize * 3;
-                let dest_y_offset = i * fb_info.bytes_per_line as usize;
-                for x in 0..img_width.min(fb_info.width) {
-                    let src_x_offset = x as usize * 3;
-                    let dest_x_offset = (start_x + x) as usize * bytes_per_pixel + dest_y_offset;
-                    let pixel = &img_raw[src_y_offset + src_x_offset..src_y_offset + src_x_offset + 3];
-                    line_buffer[dest_x_offset..dest_x_offset + 3].copy_from_slice(pixel);
-                }
-            }
-            let dest_y_offset = (start_y + y) as usize * fb_info.bytes_per_line as usize;
-            let mut framebuffer_unlocked = framebuffer_clone.lock();
-            framebuffer_unlocked.seek(SeekFrom::Start(dest_y_offset as u64)).expect("Failed to seek in framebuffer");
-            framebuffer_unlocked.write(&line_buffer).expect("Failed to write to framebuffer");
-        });
-        let elapsed = start.elapsed();
-        println!("Copying to fb Elapsed: {:?}", elapsed);
-    } else {
-        // To draw the image at 2/3 of the screen width, calculate the starting position
-        let x_offset_ratio = 2.0 / 3.0;
-        let start_x = ((fb_info.width as f32 * x_offset_ratio) - (scale as f32 * img_width as f32 * x_offset_ratio)) as u32;
-        let start_y = (fb_info.height - scale * img_height - status_bar_height) / 2;
-
-        // If image is not type Rgb8 (actually bgr8), warning
-        if img.color() != image::ColorType::Rgb8 {
-            println!("Warning: image color type is not Rgb8(BGR8)");
-        }
-
-        let img_raw = img.as_rgb8().unwrap().as_raw();
-        let framebuffer_clone = Arc::clone(&framebuffer);
-
-        let line_batch = 1.max(rayon::current_num_threads() / scale as usize);
-
-        // draw the white space first
-        let empty_line_buffer = vec![0xFFu8; fb_info.bytes_per_line as usize];
-        (0..start_y.min(fb_info.height)).into_par_iter().for_each(|y| {
-            let dest_y_offset = y as usize * fb_info.bytes_per_line as usize;
-            let mut framebuffer_unlocked = framebuffer_clone.lock();
-            framebuffer_unlocked.seek(SeekFrom::Start(dest_y_offset as u64)).expect("Failed to seek in framebuffer");
-            framebuffer_unlocked.write(&empty_line_buffer).expect("Failed to write to framebuffer");
-        });
-        // draw the image line-by-line, but draw multiple lines at once to reduce the number of write calls
-        println!("line_batch: {}", line_batch);
-        (0..img_height.min(fb_info.height)).into_par_iter().step_by(line_batch).for_each(|y| {
-            let mut line_buffer = vec![0xFFu8; fb_info.bytes_per_line as usize * line_batch];
-            for i in 0..line_batch {
-                let y = y as usize;
-                let yi = y + i;
-                if yi >= img_height.min(fb_info.height) as usize{
-                    break;
-                }
-                // Extract the line from the image's raw data
-                let src_y_offset = yi as usize * img_width as usize * 3;
-                let dest_y_offset = i * fb_info.bytes_per_line as usize;
-                for x in 0..img_width.min(fb_info.width) {
-                    let src_x_offset = x as usize * 3;
-                    let pixel = &img_raw[src_y_offset + src_x_offset..src_y_offset + src_x_offset + 3];
-                    for j_repeat in 0..scale {
-                        let dest_x_offset = (start_x + scale * x + j_repeat) as usize * bytes_per_pixel + dest_y_offset;
-                        line_buffer[dest_x_offset..dest_x_offset + 3].copy_from_slice(pixel);
-                    }
-                }
-            }
-            let mut framebuffer_unlocked = framebuffer_clone.lock();
-            let dest_y_offset = (start_y + scale * y) as usize * fb_info.bytes_per_line as usize;
-            framebuffer_unlocked.seek(SeekFrom::Start(dest_y_offset as u64)).expect("Failed to seek in framebuffer");
-            for _j_repeat in 0..scale as u32 {
-                framebuffer_unlocked.write(&line_buffer).expect("Failed to write to framebuffer");
-            }
-        });
-        // draw the white space last
-        ((start_y+img_height * scale)..(fb_info.height-status_bar_height - 16)).into_par_iter().for_each(|y| { // The raspberrypi have some error at the screen corner, move the status bar up a bit
-            let dest_y_offset = y as usize * fb_info.bytes_per_line as usize;
-            let mut framebuffer_unlocked = framebuffer_clone.lock();
-            framebuffer_unlocked.seek(SeekFrom::Start(dest_y_offset as u64)).expect("Failed to seek in framebuffer");
-            framebuffer_unlocked.write(&empty_line_buffer).expect("Failed to write to framebuffer");
-        });
-        let elapsed = start.elapsed();
-        println!("Copying to fb Elapsed: {:?}", elapsed);
-
+    // If image is not type Rgb8 (actually bgr8), warning
+    if img.color() != image::ColorType::Rgb8 {
+        println!("Warning: image color type is not Rgb8(BGR8)");
     }
+
+    let img_raw = img.as_rgb8().unwrap().as_raw();
+
+    // draw the white space first, parallelize the drawing
+    mmap[0..start_y * bytes_per_line].fill(0xFFu8);
+    // draw the image
+    let image_buffer = &mut mmap[start_y * bytes_per_line..(start_y + img_height * scale) * bytes_per_line];
+    // draw the image line by line, parallelize the drawing, combine several lines as a batch
+    image_buffer.par_chunks_mut(scale * bytes_per_line).enumerate().for_each(|(y, target_line_chunk)| {
+        // locate the original image line
+        let y_src = y;
+        if y_src >= img_height {
+            return;
+        }
+        // use local memory buffer to store the line data
+        let mut line_buffer = vec![0u8; bytes_per_line];
+        // draw the first target line
+        // draw the white space at the beggining of the line
+        line_buffer[0..start_x as usize * bytes_per_pixel].fill(0xFFu8);
+        // calculate the offset in the image raw data
+        let src_y_offset = y_src as usize * img_width as usize * 3;
+        for x in 0..img_width {
+            let src_x_offset = x as usize * 3;
+            let pixel = &img_raw[src_y_offset + src_x_offset..src_y_offset + src_x_offset + 3];
+            // repeat pixels scale times in the target line
+            for j_repeat in 0..scale {
+                let dest_x_offset = (start_x + scale * x + j_repeat) as usize * bytes_per_pixel;
+                line_buffer[dest_x_offset..dest_x_offset + 3].copy_from_slice(pixel);
+            }
+        }
+        // draw the white space at the end of the line
+        line_buffer[end_x * bytes_per_pixel..].fill(0xFFu8);
+    
+        // copy the first target line to the rest of the lines in the chunk
+        for j_repeat in 0..scale {
+            let target_line = &mut target_line_chunk[j_repeat * bytes_per_line..(j_repeat + 1) * bytes_per_line];
+            target_line.copy_from_slice(&line_buffer);
+        }
+    });
+
+    // draw the white space last, including the status bar area as background
+    mmap[end_y * bytes_per_line..(fb_height - status_bar_height - 16) * bytes_per_line].fill(0xFFu8); // The raspberrypi have some error at the screen corner, move the status bar up a bit
+    let elapsed = start.elapsed();
+    println!("Copying to fb Elapsed: {:?}", elapsed);
+
 
     // Draw status bar
+    let start_y = fb_height - status_bar_height - 16; // The raspberrypi have some error at the screen corner, move the status bar up a bit
+    let y_offset = start_y  * bytes_per_line;
     // Prepare buffer according to framebuffer's pixel layout
     let start = std::time::Instant::now();
-    let mut statusbar_buffer = vec![0xFFu8; (status_bar_height * fb_info.bytes_per_line) as usize];
+    let mut statusbar_buffer = vec![0xFFu8; status_bar_height * bytes_per_line];
     draw_statusbar_text(&mut statusbar_buffer, fb_info, config, status_text);
-    let start_y = fb_info.height - status_bar_height - 16; // The raspberrypi have some error at the screen corner, move the status bar up a bit
-    let y_offset = start_y as usize * fb_info.bytes_per_line as usize;
-
-    {
-        let mut framebuffer_unlocked = framebuffer.lock();
-        framebuffer_unlocked.seek(SeekFrom::Start(y_offset as u64)).expect("Failed to seek in framebuffer");
-        framebuffer_unlocked.write(&statusbar_buffer).expect("Failed to write to framebuffer");
-    }
+    let statusbar_target = &mut mmap[y_offset..y_offset + status_bar_height * bytes_per_line];
+    statusbar_target.copy_from_slice(&statusbar_buffer);
 
     let elapsed = start.elapsed();
     println!("Drawing status bar Elapsed: {:?}", elapsed);
+    // flush the data to the framebuffer
+    //mmap.flush_async_range(0, framebuffer_size).expect("Failed to flush data");
+    //mmap.flush().expect("Failed to flush data");
 }
