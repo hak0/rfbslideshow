@@ -156,6 +156,20 @@ fn main() {
         run_slideshow(fb_state, slideshow_state_clone, config_clone, tx);
     });
 
+    // Setup signal handler for SIGINT
+    ctrlc::set_handler(move || {
+        println!("SIGINT received");
+        // Perform your cleanup here
+        let tty_path = "/dev/tty0";
+        let path = PathBuf::from(tty_path);
+        // switch back to tty text mode, so after exiting, the user returned to the interactive shell
+        framebuffer::Framebuffer::set_kd_mode_ex(&path, framebuffer::KdMode::Text).expect("Failed to set KD_TEXT mode");
+        println!("Dropped FrameBufferState, setting /dev/tty0 back to text mode.");
+        // normal exit
+        std::process::exit(0);
+    }).expect("Error setting SIGINT(ctrl+c) handler");
+
+
     // Keep the main function alive
     loop {
         std::thread::sleep(std::time::Duration::from_secs(60));
@@ -165,7 +179,7 @@ fn main() {
 fn setup_framebuffer() -> FrameBufferState {
     let framebuffer_path = "/dev/fb0";
     let path = PathBuf::from(framebuffer_path);
-    let file = OpenOptions::new().read(true).write(true).create(true).open(path).expect("Failed to open fb file");
+    let file = OpenOptions::new().read(true).write(true).create(true).open(&path).expect("Failed to open fb file");
     //let screeninfo =  framebuffer::VarScreeninfo { xres: 3840, yres: 2160, xres_virtual: 3840, yres_virtual: 2160, xoffset: 0, yoffset: 0, bits_per_pixel: 32, grayscale: 0, red: framebuffer::Bitfield { offset: 16, length: 8, msb_right: 0 }, green: framebuffer::Bitfield { offset: 8, length: 8, msb_right: 0 }, blue: framebuffer::Bitfield { offset: 0, length: 8, msb_right: 0 }, transp: framebuffer::Bitfield { offset: 24, length: 8, msb_right: 0 }, nonstd: 0, activate: 0, height: 0, width: 0, accel_flags: 1, pixclock: 0, left_margin: 0, right_margin: 0, upper_margin: 0, lower_margin: 0, hsync_len: 0, vsync_len: 0, sync: 0, vmode: 512, rotate: 0, colorspace: 0, reserved: [0, 0, 0, 0] };
     let mut screeninfo = framebuffer::Framebuffer::get_var_screeninfo(&file).expect("failed to get var_screen_info");
     screeninfo.yres_virtual = screeninfo.yres * FB_NUM_BUFFERS as u32;
@@ -187,6 +201,10 @@ fn setup_framebuffer() -> FrameBufferState {
         mmap.advise(memmap2::Advice::Sequential).expect("Failed to advise mmap");
         mmap.advise(memmap2::Advice::DontFork).expect("Failed to advise mmap");
     }
+    // enter kd_mode graphics to avoid strange tty output like unervoltage or something
+    let tty_path = "/dev/tty0";
+    let path = PathBuf::from(tty_path);
+    framebuffer::Framebuffer::set_kd_mode_ex(&path, framebuffer::KdMode::Graphics).expect("Failed to set KD_GRAPHICS mode");
     FrameBufferState {
         mmap: Arc::new(Mutex::new(mmap)),
         fb_info: fbinfo,
@@ -283,6 +301,10 @@ fn setup_routes(request: &Request, slideshow_state: Arc<SlideshowState>, config:
             slideshow_state.current_index.store(0, Ordering::Relaxed);
 
             let folder_path = config.folder_path.read().unwrap().clone();
+            // skip if folder doesn't exist
+            if !Path::new(&folder_path).exists() {
+                return Response::json(&"Folder doesn't exist");
+            }
             for entry in fs::read_dir(&folder_path).unwrap() {
                 let entry = entry.unwrap();
                 let path = entry.path();
@@ -303,6 +325,11 @@ fn setup_routes(request: &Request, slideshow_state: Arc<SlideshowState>, config:
 
             slideshow_state.paused.store(true, Ordering::Relaxed);
             let folder_path = config.folder_path.read().unwrap().clone();
+            // create folder path if not existing
+            if !Path::new(&folder_path).exists() {
+                fs::create_dir_all(&folder_path).unwrap();
+            }
+
             let image_path = Path::new(&folder_path).join(&image_name);
 
             if image_path.exists() {
@@ -712,7 +739,7 @@ fn write_to_framebuffer(img: &DynamicImage, status_text: &str, fb_state: Arc<Fra
     let start_x = ((fb_width as f32 * x_offset_ratio) - (scale as f32 * img_width as f32 * x_offset_ratio)) as usize;
     let start_y = (fb_height - scale * img_height - status_bar_height) / 2;
     let end_x = (start_x + img_width * scale).min(fb_width);
-    let end_y = (start_y + img_height * scale).min(fb_height - status_bar_height - 16); // The raspberrypi have some error at the screen corner, move the status bar up a bit
+    let end_y = (start_y + img_height * scale).min(fb_height - status_bar_height);
 
     // If image is not type Rgb8 (actually bgr8), warning
     if img.color() != image::ColorType::Rgb8 {
@@ -761,13 +788,13 @@ fn write_to_framebuffer(img: &DynamicImage, status_text: &str, fb_state: Arc<Fra
     }
 
     // draw the white space last, including the status bar area as background
-    mmap[end_y * bytes_per_line..(fb_height - status_bar_height - 16) * bytes_per_line].fill(0xFFu8); // The raspberrypi have some error at the screen corner, move the status bar up a bit
+    mmap[end_y * bytes_per_line..(fb_height - status_bar_height) * bytes_per_line].fill(0xFFu8);
     let elapsed = start.elapsed();
     println!("Copying to fb Elapsed: {:?}", elapsed);
 
 
     // Draw status bar
-    let start_y = fb_height - status_bar_height - 16; // The raspberrypi have some error at the screen corner, move the status bar up a bit
+    let start_y = fb_height - status_bar_height;
     let y_offset = start_y  * bytes_per_line;
     // Prepare buffer according to framebuffer's pixel layout
     let start = std::time::Instant::now();
