@@ -439,7 +439,7 @@ fn run_slideshow(
                     });
                     Some(())
                 },
-                ImageFormat::WebP, ImageFormat::Png, ImageFormat::Jpeg, ImageFormat::Bmp => {
+                ImageFormat::WebP | ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Bmp => {
                     let cloned_config = config.clone();
                     let cloned_fb_state = fb_state.clone();
                     let cloned_terminal_signal = terminal_signal.clone();
