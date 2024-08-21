@@ -65,13 +65,14 @@ sudo usermod -a -G dialout $USER
 
 A web server will be started to accept remote commands. By default the URL is `http://ip:3030`. Users can use cURL or other http clients to control the slideshow.
 
-* http://serverhost/pause -> pause the slideshow loop
-* http://serverhost/resume -> resume the slideshow loop
-* http://serverhost/prev -> move to the previous image
-* http://serverhost/next -> move to the next image
-* http://serverhost/rescan -> rescan the folder and restart the slideshow
-* http://serverhost/reload -> reload the config file
-* http://serverhost/seek/{index} -> move to the specified index
-* http://serverhost/query -> query the current image name
-* http://serverhost/clearfolder -> clear the folder
-* http://serverhost/upload/{image_name} -> upload an image to the folder
+* (GET)http://serverhost/pause -> pause the slideshow loop. cURL command exmaple: `curl "http://ip:3030/next"`
+* (GET)http://serverhost/resume -> resume the slideshow loop
+* (GET)http://serverhost/prev -> move to the previous image
+* (GET)http://serverhost/next -> move to the next image
+* (GET)http://serverhost/rescan -> rescan the folder and restart the slideshow
+* (GET)http://serverhost/reload -> reload the config file
+* (GET)http://serverhost/seek/{index} -> move to the specified index
+* (GET)http://serverhost/query -> query the current image name
+* (GET)http://serverhost/clearfolder -> clear the folder
+* (POST)http://serverhost/upload/{image_name} -> upload an image to the folder. cURL command example: `curl -X POST http://ip:3030/upload/image1.jpg -H "Content-Type: application/octet-stream" --data-binary "@local_file_path.jpg"
+`
