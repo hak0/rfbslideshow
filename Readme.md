@@ -6,6 +6,10 @@ A lightweight Rust slideshow program based on frame buffer. No need for x11 or w
 * Fb = framebuffer
 * slideshow = this is a slideshow program
 
+## Screenshot
+
+![frame-2](https://github.com/user-attachments/assets/f8848602-acc0-4912-b83d-2f310d34452b)
+
 ## Usage
 
 ```
