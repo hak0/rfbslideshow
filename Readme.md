@@ -32,7 +32,7 @@ So far it is customized to fit my own needs, so it may look strange and rough. I
 
 ## Story
 
-I use a raspberrypi 3b to play slideshow, and managed to get 4k output according to this [stack exchange]. However, since the raspberrypi 3b's graphic driver doesn't support resolution over 1080p, the slideshow programs like `sxiv` and `imvr` are slow, especially when handling gif animations.
+I use a raspberrypi 3b to play slideshow, and managed to get 4k output according to this [stack exchange](https://raspberrypi.stackexchange.com/questions/44089/can-raspberry-pi-3-do-4k-video). However, since the raspberrypi 3b's graphic driver doesn't support resolution over 1080p, the slideshow programs like `sxiv` and `imvr` are slow, especially when handling gif animations.
 
 So I decided to start from the bare minimum, that is, writing to the framebuffer directly, and control it from the LAN using http requests.
 
