@@ -47,6 +47,8 @@ During the start, the program rfbslideshow will need to set kd_mode into KD_GRAP
 This operation require `CAP_SYS_TTY_CONFIG` capability. To run program without `sudo`, we need to add this capability to the program.
 
 ```bash
+# allow program to modify tty
+sudo chmod 777 /dev/tty0
 # set the capabliity
 sudo setcap 'CAP_SYS_TTY_CONFIG=eip' ./rfbslideshow
 # check the capability
