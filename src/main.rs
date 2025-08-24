@@ -18,7 +18,7 @@ use rouille::{Request, Response};
 use std::fs::OpenOptions;
 use memmap2::{MmapOptions, MmapMut};
 
-const FB_NUM_BUFFERS: usize = 2; // 2 is the maximum on raspberrypi
+const FB_NUM_BUFFERS: usize = 1 ; // 2 is the maximum on raspberrypi3b, and 1 for 400
 
 // thread-safe version of config
 struct Config {
@@ -540,7 +540,7 @@ fn resize_image(img: &DynamicImage, fb_info: &FrameBufferInfo, config: Arc<Confi
 
 fn draw_statusbar_text(raw_mem: &mut [u8], fb_info: &FrameBufferInfo,config: Arc<Config>, status_text: &str) {
     // Create a new image for the status bar only
-    let bytes_per_pixel = (fb_info.bits_per_pixel / 8) as i32;
+    let bytes_per_pixel = (fb_info.bits_per_pixel / 8) as usize;
 
     // Read the font data from the file specified in the config
     // check if font exists
@@ -573,23 +573,34 @@ fn draw_statusbar_text(raw_mem: &mut [u8], fb_info: &FrameBufferInfo,config: Arc
                 let x = x as i32 + bounding_box.min.x;
                 let y = y as i32 + bounding_box.min.y;
                 if x >= 0 && x < fb_info.width as i32 && y >= 0 && y < status_bar_height as i32 {
-                    let x_offset = (x * bytes_per_pixel) as usize;
+                    let x_offset = (x as usize * bytes_per_pixel) as usize;
                     let y_offset = y as usize * fb_info.bytes_per_line as usize;
-                    // reverse rgb to bgr
-                    let r = (v * text_color[0] as f32 + (1.0 - v) * bar_color[0] as f32) as u8;
-                    let g = (v * text_color[1] as f32 + (1.0 - v) * bar_color[1] as f32) as u8;
-                    let b = (v * text_color[2] as f32 + (1.0 - v) * bar_color[2] as f32) as u8;
-                    raw_mem[y_offset + x_offset + 0] = b;
-                    raw_mem[y_offset + x_offset + 1] = g;
-                    raw_mem[y_offset + x_offset + 2] = r;
+
+                    if bytes_per_pixel == 2 {
+                        // Convert to RGB565 format
+                        let r = (v * text_color[0] as f32 + (1.0 - v) * bar_color[0] as f32) as u16;
+                        let g = (v * text_color[1] as f32 + (1.0 - v) * bar_color[1] as f32) as u16;
+                        let b = (v * text_color[2] as f32 + (1.0 - v) * bar_color[2] as f32) as u16;
+                        let rgb565 = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+                        raw_mem[y_offset + x_offset..y_offset + x_offset + 2].copy_from_slice(&rgb565.to_le_bytes());
+                    } else {
+                        // RGB888 format - reverse rgb to bgr
+                        let r = (v * text_color[0] as f32 + (1.0 - v) * bar_color[0] as f32) as u8;
+                        let g = (v * text_color[1] as f32 + (1.0 - v) * bar_color[1] as f32) as u8;
+                        let b = (v * text_color[2] as f32 + (1.0 - v) * bar_color[2] as f32) as u8;
+                        raw_mem[y_offset + x_offset + 0] = b;
+                        raw_mem[y_offset + x_offset + 1] = g;
+                        raw_mem[y_offset + x_offset + 2] = r;
+                    }
                 }
             });
         }
     }
 }
 
-fn convert_rgba_or_rgb_to_bgr(img: DynamicImage) -> DynamicImage {
+fn convert_rgba_or_rgb_to_bgr(img: DynamicImage, _fb_state: Arc<FrameBufferState>) -> DynamicImage {
     let start = std::time::Instant::now();
+
     let img = match img.color() {
         image::ColorType::Rgba8 => {
             // Convert to RGBA8
@@ -598,10 +609,8 @@ fn convert_rgba_or_rgb_to_bgr(img: DynamicImage) -> DynamicImage {
             let img_raw = img.into_raw();
             let img_pixels = img_raw.len() / 4; // Number of pixels
 
-            // Create a new vector to store the BGR data
+            // Always convert to BGR format (RGB888)
             let mut bgr_raw = vec![0u8; img_pixels * 3];
-
-            // Process each pixel in parallel
             bgr_raw.par_chunks_mut(3).enumerate().for_each(|(i, bgr_pixel)| {
                 let r = img_raw[i * 4] as u16;
                 let g = img_raw[i * 4 + 1] as u16;
@@ -617,8 +626,6 @@ fn convert_rgba_or_rgb_to_bgr(img: DynamicImage) -> DynamicImage {
                 bgr_pixel[1] = g;
                 bgr_pixel[2] = r;
             });
-
-            // Create a new ImageBuffer from the BGR data
             let new_buffer = image::ImageBuffer::from_vec(img_width, img_height, bgr_raw);
             DynamicImage::ImageRgb8(new_buffer.unwrap())
         },
@@ -626,7 +633,8 @@ fn convert_rgba_or_rgb_to_bgr(img: DynamicImage) -> DynamicImage {
             let img_buffer = img.to_rgb8();
             let (img_width, img_height) = img_buffer.dimensions();
             let mut img_raw = img_buffer.into_raw();
-            // rgb -> bgr
+
+            // Always convert to BGR format (RGB888)
             img_raw.par_chunks_mut(3).for_each(|pixel| {
                 pixel.swap(0, 2);
             });
@@ -651,7 +659,7 @@ fn display_single_img(path: &Path, format: ImageFormat, config: Arc<Config>, fb_
         if terminal_signal.load(std::sync::atomic::Ordering::Relaxed) { return; }
 
         // convert the image to bgr format
-        let img = convert_rgba_or_rgb_to_bgr(img);
+        let img = convert_rgba_or_rgb_to_bgr(img, fb_state.clone());
 
 
         // if terminal_signal is true, skip loading image and early return
@@ -682,7 +690,7 @@ fn display_gif(path: &Path, config: Arc<Config>, fb_state: Arc<FrameBufferState>
                 // cache it in the img_vec
                 let delay = frame.delay();
                 let img = DynamicImage::ImageRgba8(frame.into_buffer());
-                let img = convert_rgba_or_rgb_to_bgr(img);
+                let img = convert_rgba_or_rgb_to_bgr(img, fb_state.clone());
                 let pair = (img, delay);
                 img_vec.push(pair.clone());
                 pair
@@ -748,6 +756,7 @@ fn write_to_framebuffer(img: &DynamicImage, status_text: &str, fb_state: Arc<Fra
 
     let img_raw = img.as_rgb8().unwrap().as_raw();
 
+    // Fill background - white for both RGB565 and RGB888 formats
     // draw the white space first, parallelize the drawing
     mmap[0..start_y * bytes_per_line].fill(0xFFu8);
     // draw the image
@@ -765,7 +774,7 @@ fn write_to_framebuffer(img: &DynamicImage, status_text: &str, fb_state: Arc<Fra
             // draw the first target line
             // draw the white space at the beggining of the line
             line_buffer[0..start_x as usize * bytes_per_pixel].fill(0xFFu8);
-            // calculate the offset in the image raw data
+            // calculate the offset in the image raw data (always RGB888 format)
             let src_y_offset = y_src as usize * img_width as usize * 3;
             for x in 0..img_width {
                 let src_x_offset = x as usize * 3;
@@ -773,12 +782,22 @@ fn write_to_framebuffer(img: &DynamicImage, status_text: &str, fb_state: Arc<Fra
                 // repeat pixels scale times in the target line
                 for j_repeat in 0..scale {
                     let dest_x_offset = (start_x + scale * x + j_repeat) as usize * bytes_per_pixel;
-                    line_buffer[dest_x_offset..dest_x_offset + 3].copy_from_slice(pixel);
+                    if bytes_per_pixel == 2 {
+                        // Convert RGB888 (BGR) to RGB565
+                        let b = pixel[0] as u16;
+                        let g = pixel[1] as u16;
+                        let r = pixel[2] as u16;
+                        let rgb565 = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+                        line_buffer[dest_x_offset..dest_x_offset + 2].copy_from_slice(&rgb565.to_le_bytes());
+                    } else {
+                        // RGB888 format
+                        line_buffer[dest_x_offset..dest_x_offset + 3].copy_from_slice(pixel);
+                    }
                 }
             }
             // draw the white space at the end of the line
             line_buffer[end_x * bytes_per_pixel..].fill(0xFFu8);
-        
+
             // copy the first target line to the rest of the lines in the chunk
             for j_repeat in 0..scale {
                 let target_line = &mut target_line_chunk[j_repeat * bytes_per_line..(j_repeat + 1) * bytes_per_line];
